@@ -13,7 +13,7 @@ from enum import Enum
 from dataclasses import dataclass
 
 import httpx
-from fastapi import FastAPI, Request, Response, HTTPException, UploadFile, File, Query
+from fastapi import FastAPI, Request, Response, HTTPException, UploadFile, File, Query, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -38,28 +38,30 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_TEXT_LENGTH = 100000
+MAX_IMAGE_SIZE = 20 * 1024 * 1024
 
 SESSION_DURATION = 365 * 24 * 60 * 60
 REFRESH_THRESHOLD = 7 * 24 * 60 * 60
 
 GROQ_MAX_RETRIES = 3
 
-RATE_LIMIT_REQUESTS = 20 
-RATE_LIMIT_WINDOW = 60   
+RATE_LIMIT_REQUESTS = 20
+RATE_LIMIT_WINDOW = 60
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
 
 app = FastAPI(
     title="HeloxAi Lite",
-    description="Text, Code, Math, Research, and Image Generation Backend",
-    version="3.6.1"
+    description="Text, Code, Math, Research, Image Generation & File Analysis Backend",
+    version="3.7.0"
 )
 
 # =========================
 # MODEL CONFIGURATION
 # =========================
-GROQ_CHAT_MODEL = "qwen/qwen3-32b"
+GROQ_CHAT_MODEL = "llama-3.3-70b-versatile"
+GROQ_VISION_MODEL = "llama-3.2-90b-vision-preview"
 GROQ_STT_MODEL = "whisper-large-v3"
 OPENAI_TTS_MODEL = "tts-1"
 OPENAI_IMAGE_MODEL = "gpt-image-1"
@@ -113,24 +115,24 @@ def _get_conv_lock(conv_id: str) -> asyncio.Lock:
 async def rate_limit_middleware(request: Request, call_next):
     if request.url.path == "/" or request.method == "OPTIONS":
         return await call_next(request)
-    
+
     client_ip = request.client.host if request.client else "unknown"
     now = time.time()
-    
+
     if client_ip not in _rate_limit_store:
         _rate_limit_store[client_ip] = []
-    
+
     _rate_limit_store[client_ip] = [
         t for t in _rate_limit_store[client_ip] if now - t < RATE_LIMIT_WINDOW
     ]
-    
+
     if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_REQUESTS:
         logger.warning(f"Rate limit hit for IP: {client_ip}")
         return JSONResponse(
             status_code=429,
             content={"detail": "Too many requests. Please slow down."}
         )
-    
+
     _rate_limit_store[client_ip].append(now)
     response = await call_next(request)
     return response
@@ -142,20 +144,28 @@ class FileCategory(Enum):
     CODE = "code"
     DOCUMENT = "document"
     DATA = "data"
+    IMAGE = "image"
     UNKNOWN = "unknown"
 
 CODE_EXTENSIONS = {
     '.py', '.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.java',
     '.c', '.cpp', '.go', '.rs', '.php', '.rb', '.swift', '.sql',
-    '.json', '.yaml', '.xml'
+    '.json', '.yaml', '.xml', '.h', '.hpp', '.cs', '.kt', '.dart',
+    '.lua', '.r', '.m', '.mm', '.sh', '.bash', '.zsh', '.ps1',
+    '.scala', '.clj', '.hs', '.ex', '.exs', '.erl', '.zig', '.nim',
+    '.v', '.sol', '.move', '.tf', '.hcl', '.dockerfile', '.makefile',
+    '.cmake', '.gradle', '.pom', '.csproj', '.sln', '.vue', '.svelte'
 }
-DOCUMENT_EXTENSIONS = {'.txt', '.md', '.csv', '.pdf', '.doc', '.docx', '.log'}
-DATA_EXTENSIONS = {'.csv', '.json', '.xml', '.yaml'}
+DOCUMENT_EXTENSIONS = {'.txt', '.md', '.csv', '.pdf', '.doc', '.docx', '.log', '.rtf', '.odt'}
+DATA_EXTENSIONS = {'.csv', '.json', '.xml', '.yaml', '.yml', '.tsv', '.ini', '.toml', '.env'}
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.tiff', '.ico'}
 
 def get_file_category(filename: str) -> FileCategory:
     if not filename:
         return FileCategory.UNKNOWN
     ext = Path(filename).suffix.lower()
+    if ext in IMAGE_EXTENSIONS:
+        return FileCategory.IMAGE
     if ext in CODE_EXTENSIONS:
         return FileCategory.CODE
     if ext in DOCUMENT_EXTENSIONS:
@@ -164,6 +174,29 @@ def get_file_category(filename: str) -> FileCategory:
         return FileCategory.DATA
     return FileCategory.UNKNOWN
 
+def get_language_from_extension(filename: str) -> str:
+    ext = Path(filename).suffix.lower()
+    lang_map = {
+        '.py': 'Python', '.js': 'JavaScript', '.ts': 'TypeScript',
+        '.jsx': 'React JSX', '.tsx': 'React TSX', '.html': 'HTML',
+        '.css': 'CSS', '.java': 'Java', '.c': 'C', '.cpp': 'C++',
+        '.go': 'Go', '.rs': 'Rust', '.php': 'PHP', '.rb': 'Ruby',
+        '.swift': 'Swift', '.sql': 'SQL', '.json': 'JSON',
+        '.yaml': 'YAML', '.yml': 'YAML', '.xml': 'XML',
+        '.h': 'C Header', '.hpp': 'C++ Header', '.cs': 'C#',
+        '.kt': 'Kotlin', '.dart': 'Dart', '.lua': 'Lua',
+        '.r': 'R', '.m': 'Objective-C', '.mm': 'Objective-C++',
+        '.sh': 'Shell', '.bash': 'Bash', '.zsh': 'Zsh',
+        '.ps1': 'PowerShell', '.scala': 'Scala', '.clj': 'Clojure',
+        '.hs': 'Haskell', '.ex': 'Elixir', '.exs': 'Elixir',
+        '.erl': 'Erlang', '.zig': 'Zig', '.nim': 'Nim',
+        '.v': 'V', '.sol': 'Solidity', '.vue': 'Vue',
+        '.svelte': 'Svelte', '.md': 'Markdown', '.txt': 'Plain Text',
+        '.csv': 'CSV', '.log': 'Log', '.dockerfile': 'Dockerfile',
+        '.makefile': 'Makefile', '.tf': 'Terraform', '.hcl': 'HCL',
+    }
+    return lang_map.get(ext, 'Unknown')
+
 async def extract_text_safe(content: bytes) -> str:
     for enc in ['utf-8', 'latin-1', 'cp1252']:
         try:
@@ -171,6 +204,9 @@ async def extract_text_safe(content: bytes) -> str:
         except Exception:
             continue
     return "[Binary or unreadable content]"
+
+def _is_image_mime(mime: str) -> bool:
+    return mime and mime.startswith("image/")
 
 # =========================
 # AUTH SYSTEM
@@ -283,7 +319,7 @@ async def create_user_session(user_id: str, remember: bool = True) -> Optional[s
 # =========================
 # SYSTEM PROMPTS
 # =========================
-BASE_SYSTEM_PROMPT = """You are HeloxAi, a powerful AI assistant.
+BASE_SYSTEM_PROMPT = """You are HeloxAi, a powerful AI assistant powered by Llama 3.3 70B.
 
 **Capabilities:**
 1. **Text & Reasoning:** Advanced understanding, reasoning, writing, and conversation.
@@ -298,6 +334,49 @@ BASE_SYSTEM_PROMPT = """You are HeloxAi, a powerful AI assistant.
 
 **Identity:**
 - If asked who created you, say: "I was constructed by GoldYLocks. You can find them on Twitter @HeloxAi"."""
+
+IMAGE_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, an expert visual analyst powered by Llama 3.2 90B Vision.
+
+Analyze the provided image thoroughly. Cover:
+1. **Description:** What is shown in the image (objects, scene, people, text, etc.)
+2. **Details:** Notable colors, layout, style, composition, quality
+3. **Context:** What the image might be used for, its likely purpose
+4. **Text:** If there is any readable text in the image, transcribe it exactly
+5. **Issues:** Any problems, errors, or anomalies visible
+
+Be specific and precise. If the image contains code screenshots, read and explain the code.
+If it's a diagram or chart, describe the data/trends shown.
+Use Markdown formatting for structure."""
+
+CODE_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, a senior software engineer and code reviewer powered by Llama 3.3 70B.
+
+Analyze the provided code thoroughly:
+
+1. **Overview:** What does this code do? What language and purpose?
+2. **Architecture:** How is it structured? Patterns used?
+3. **Quality Assessment:** Rate code quality (1-10) with justification
+4. **Issues Found:**
+   - 🔴 **Critical:** Bugs, security vulnerabilities, crashes
+   - 🟡 **Warnings:** Bad practices, performance issues, maintainability
+   - 🟢 **Suggestions:** Improvements, modernizations, best practices
+5. **Security Review:** Any vulnerabilities (XSS, injection, auth issues, etc.)
+6. **Performance:** Any bottlenecks or inefficiencies
+7. **Refactored Version:** Provide an improved version of the code with fixes applied
+
+Be specific — reference line numbers or code sections. Provide working improved code."""
+
+DOCUMENT_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, an expert document analyst powered by Llama 3.3 70B.
+
+Analyze the provided document/file content thoroughly:
+
+1. **Summary:** Concise summary of the content (2-3 sentences)
+2. **Key Points:** Bullet points of the main ideas/facts
+3. **Structure:** How is the document organized?
+4. **Analysis:** Deep analysis of the content, arguments, or data
+5. **Issues:** Any errors, inconsistencies, or problems found
+6. **Recommendations:** Suggestions for improvement or next steps
+
+Be thorough but well-organized. Use Markdown formatting."""
 
 def get_system_prompt(user_prompt: str) -> str:
     return BASE_SYSTEM_PROMPT
@@ -380,7 +459,7 @@ class AdvancedIntentDetector:
             matches = sum(1 for p in patterns if p.search(text))
             if matches > 0:
                 return IntentResult(intent=intent, confidence=min(0.6 + matches * 0.1, 0.98))
-        
+
         for intent, patterns in self.compiled_patterns.items():
             if intent == IntentCategory.IMAGE_GENERATION:
                 continue
@@ -401,6 +480,13 @@ class ChatRequest(BaseModel):
     remember: bool = True
     image_size: str = "1024x1024"
     image_quality: str = "medium"
+
+class AnalysisRequest(BaseModel):
+    prompt: Optional[str] = None
+    conversation_id: Optional[str] = None
+    stream: bool = True
+    remember: bool = True
+    analysis_type: Optional[str] = None  # "image", "code", "document", "auto"
 
 # =========================
 # HELPERS
@@ -532,7 +618,8 @@ async def perform_web_search(query: str) -> str:
         logger.error(f"Search failed: {e}")
         return "[Search failed]"
 
-async def stream_groq_chat(messages: list):
+async def stream_groq_chat(messages: list, model: str = None):
+    use_model = model or GROQ_CHAT_MODEL
     attempt = 0
     while attempt < GROQ_MAX_RETRIES:
         attempt += 1
@@ -543,10 +630,10 @@ async def stream_groq_chat(messages: list):
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers=get_groq_headers(),
                     json={
-                        "model": GROQ_CHAT_MODEL,
+                        "model": use_model,
                         "messages": messages,
                         "stream": True,
-                        "max_tokens": 2048
+                        "max_tokens": 4096
                     }
                 ) as resp:
                     if resp.status_code == 429:
@@ -554,12 +641,12 @@ async def stream_groq_chat(messages: list):
                         retry_delay = _parse_retry_after(error_body)
                         logger.warning(f"Groq 429. Attempt {attempt}/{GROQ_MAX_RETRIES}. Retrying in {retry_delay:.1f}s...")
                         await asyncio.sleep(retry_delay)
-                        continue 
+                        continue
 
                     if resp.status_code != 200:
                         error_body = await resp.aread()
                         raise Exception(f"Groq Error {resp.status_code}: {error_body.decode()}")
-                    
+
                     async for line in resp.aiter_lines():
                         if line.startswith("data: "):
                             payload = line[6:]
@@ -582,19 +669,41 @@ async def stream_groq_chat(messages: list):
 
     raise Exception(f"Groq rate limit exceeded after {GROQ_MAX_RETRIES} retries.")
 
+async def groq_chat_sync(messages: list, model: str = None, max_tokens: int = 4096) -> str:
+    """Non-streaming Groq chat completion with retry."""
+    use_model = model or GROQ_CHAT_MODEL
+    attempt = 0
+    while attempt < GROQ_MAX_RETRIES:
+        attempt += 1
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=get_groq_headers(),
+                json={"model": use_model, "messages": messages, "max_tokens": max_tokens}
+            )
+            if r.status_code == 429:
+                retry_delay = _parse_retry_after(r.text)
+                logger.warning(f"Groq 429 (sync). Attempt {attempt}/{GROQ_MAX_RETRIES}. Retrying in {retry_delay:.1f}s...")
+                await asyncio.sleep(retry_delay)
+                continue
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+
+    raise Exception(f"Groq rate limit exceeded after {GROQ_MAX_RETRIES} retries.")
+
 async def generate_image_openai_sync(prompt: str, size: str = "1024x1024", quality: str = "medium") -> str:
     """Generate image and return pure base64 string (Non-streaming)"""
     if not OPENAI_API_KEY:
         raise Exception("OpenAI API Key not configured")
-    
+
     valid_sizes = ["1024x1024", "1536x1024", "1024x1536"]
     if size not in valid_sizes:
         size = "1024x1024"
-    
+
     valid_qualities = ["low", "medium", "high"]
     if quality not in valid_qualities:
         quality = "medium"
-    
+
     payload = {
         "model": OPENAI_IMAGE_MODEL,
         "prompt": prompt,
@@ -603,19 +712,19 @@ async def generate_image_openai_sync(prompt: str, size: str = "1024x1024", quali
         "quality": quality,
         "stream": False
     }
-    
+
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             "https://api.openai.com/v1/images/generations",
             headers=get_openai_headers(),
             json=payload
         )
-        
+
         if resp.status_code != 200:
             error_msg = resp.text
             logger.error(f"OpenAI Image Error {resp.status_code}: {error_msg}")
             raise Exception(f"Image generation failed: {error_msg}")
-        
+
         data = resp.json()
         if data.get("data") and len(data["data"]) > 0:
             image_data = data["data"][0]
@@ -629,321 +738,686 @@ async def generate_image_openai_sync(prompt: str, size: str = "1024x1024", quali
         raise Exception("No image data in response")
 
 # =========================
-# ENDPOINTS
+# ANALYSIS HELPERS
 # =========================
+
+def _build_image_analysis_messages(image_b64: str, mime_type: str, user_prompt: Optional[str]) -> list:
+    """Build messages for vision model image analysis."""
+    user_content = [
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{mime_type};base64,{image_b64}"
+            }
+        },
+        {
+            "type": "text",
+            "text": user_prompt or "Analyze this image in detail. Describe what you see, read any text, explain any code or diagrams, and provide a comprehensive analysis."
+        }
+    ]
+    return [
+        {"role": "system", "content": IMAGE_ANALYSIS_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content}
+    ]
+
+def _build_code_analysis_messages(code_text: str, filename: str, language: str, user_prompt: Optional[str]) -> list:
+    """Build messages for code analysis."""
+    instruction = user_prompt or f"Analyze this {language} code from the file `{filename}`."
+    user_content = f"""{instruction}
+
+```{language.lower()}
+{code_text} Provide a thorough code review covering: bugs, security issues, performance, style, and an improved version if needed."""
+
+return [
+ {"role": "system", "content": CODE_ANALYSIS_SYSTEM_PROMPT},
+ {"role": "user", "content": user_content}
+]
+def _build_document_analysis_messages(doc_text: str, filename: str, user_prompt: Optional[str]) -> list:
+ """Build messages for document analysis."""
+ instruction = user_prompt or f"Analyze the content from the file {filename}."
+ user_content = f"""{instruction}
+
+--- FILE CONTENT START ---
+{doc_text}
+--- FILE CONTENT END ---
+
+Provide a thorough analysis: summary, key points, structure, issues, and recommendations."""
+
+return [
+ {"role": "system", "content": DOCUMENT_ANALYSIS_SYSTEM_PROMPT},
+ {"role": "user", "content": user_content}
+]
+=========================
+
+ENDPOINTS
+
+=========================
+
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {
-        "status": "running",
-        "service": "HeloxAi Lite",
-        "version": "3.6.1",
-        "models": {
-            "chat": GROQ_CHAT_MODEL,
-            "tts": OPENAI_TTS_MODEL,
-            "stt": GROQ_STT_MODEL,
-            "image": OPENAI_IMAGE_MODEL
-        },
-        "features": ["chat", "code", "math", "web_search", "tts", "stt", "image_generation"]
-    }
+ return {
+ "status": "running",
+ "service": "HeloxAi Lite",
+ "version": "3.7.0",
+ "models": {
+ "chat": GROQ_CHAT_MODEL,
+ "vision": GROQ_VISION_MODEL,
+ "tts": OPENAI_TTS_MODEL,
+ "stt": GROQ_STT_MODEL,
+ "image": OPENAI_IMAGE_MODEL
+ },
+ "features": [
+ "chat", "code", "math", "web_search", "tts", "stt",
+ "image_generation", "image_analysis", "code_analysis", "document_analysis"
+ ],
+ "endpoints": {
+ "chat": "POST /ask/universal",
+ "new_chat": "POST /newchat",
+ "analysis": "POST /analysis",
+ "delete_chat": "DELETE /chats/{chat_id}",
+ "list_chats": "GET /chats",
+ "messages": "GET /chat/{conversation_id}/messages",
+ "tts": "POST /tts",
+ "stt": "POST /stt",
+ "logout": "POST /session/logout"
+ }
+ }
+
+=========================
+
+ANALYSIS ENDPOINT
+
+=========================
+
+@app.post("/analysis")
+async def analyze_file(
+ req: Request,
+ res: Response,
+ file: Optional[UploadFile] = File(None),
+ prompt: Optional[str] = Form(None),
+ conversation_id: Optional[str] = Form(None),
+ stream: bool = Form(True),
+ remember: bool = Form(True),
+ analysis_type: Optional[str] = Form(None),
+ image_base64: Optional[str] = Form(None),
+ image_mime: Optional[str] = Form("image/png"),
+):
+ """
+ Analyze images, code files, or documents.
+
+Accepts multipart form data with:
+- file: Upload a file (image, code, document)
+- image_base64: Alternatively, send a base64-encoded image string
+- image_mime: MIME type for base64 image (default: image/png)
+- prompt: Custom analysis instruction (optional)
+- conversation_id: Link analysis to a conversation (optional)
+- stream: Stream the response (default: true)
+- analysis_type: Force analysis type: "image", "code", "document", or "auto" (default: auto-detect)
+"""
+user = await get_user(req, res, remember)
+
+# Determine what we're analyzing
+image_data_b64 = None
+image_mime_type = image_mime or "image/png"
+file_text_content = None
+file_filename = "unknown"
+file_category = FileCategory.UNKNOWN
+
+# Priority 1: Explicit base64 image
+if image_base64:
+ # Strip data URI prefix if present
+ clean_b64 = image_base64
+ if "," in image_base64:
+ clean_b64 = image_base64.split(",", 1)[1]
+ image_data_b64 = clean_b64.strip()
+ file_category = FileCategory.IMAGE
+ logger.info(f"Analysis: received base64 image ({len(image_data_b64)} chars)")
+
+# Priority 2: Uploaded file
+elif file and file.filename:
+ file_filename = file.filename
+ content_bytes = b""
+ while chunk := await file.read(1024 * 1024):
+ content_bytes += chunk
+ if len(content_bytes) > MAX_FILE_SIZE:
+ raise HTTPException(413, f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB.")
+
+ if len(content_bytes) == 0:
+ raise HTTPException(400, "Empty file uploaded.")
+
+ # Determine category
+ if analysis_type and analysis_type != "auto":
+ try:
+ file_category = FileCategory(analysis_type)
+ except ValueError:
+ file_category = get_file_category(file_filename)
+ else:
+ file_category = get_file_category(file_filename)
+
+ # Override with MIME check for images
+ if file.content_type and _is_image_mime(file.content_type):
+ file_category = FileCategory.IMAGE
+
+ if file_category == FileCategory.IMAGE:
+ image_data_b64 = base64.b64encode(content_bytes).decode()
+ image_mime_type = file.content_type or "image/png"
+ logger.info(f"Analysis: uploaded image file: {file_filename}")
+ else:
+ file_text_content = await extract_text_safe(content_bytes)
+ if not file_text_content.strip() or file_text_content.strip() == "[Binary or unreadable content]":
+ raise HTTPException(400, f"Could not extract text from file: {file_filename}. For images, ensure the file is a valid image format.")
+ logger.info(f"Analysis: uploaded {file_category.value} file: {file_filename} ({len(file_text_content)} chars)")
+else:
+ raise HTTPException(400, "Either 'file' or 'image_base64' must be provided.")
+
+# Build the display prompt for conversation title
+display_prompt = prompt or f"Analysis of {file_filename}"
+conv_id = await get_or_create_conversation(user_id=user["id"], proposed_id=conversation_id, title=display_prompt)
+
+# Save user message (reference, not full binary)
+if file_category == FileCategory.IMAGE:
+ user_msg = f"[Image Analysis] {file_filename if file and file.filename else 'Base64 image'}" + (f"\n{prompt}" if prompt else "")
+else:
+ language = get_language_from_extension(file_filename)
+ user_msg = f"[{file_category.value.title()} Analysis] {file_filename} ({language})" + (f"\n{prompt}" if prompt else "")
+await save_message(user["id"], conv_id, "user", user_msg)
+
+# Build messages based on category
+if file_category == FileCategory.IMAGE:
+ if not GROQ_API_KEY:
+ raise HTTPException(500, "Groq API Key required for image analysis (vision model)")
+ messages = _build_image_analysis_messages(image_data_b64, image_mime_type, prompt)
+ use_model = GROQ_VISION_MODEL
+elif file_category == FileCategory.CODE:
+ language = get_language_from_extension(file_filename)
+ messages = _build_code_analysis_messages(file_text_content, file_filename, language, prompt)
+ use_model = GROQ_CHAT_MODEL
+else:
+ messages = _build_document_analysis_messages(file_text_content, file_filename, prompt)
+ use_model = GROQ_CHAT_MODEL
+
+# Stream response
+if stream:
+ async def analysis_event_gen():
+ task = asyncio.current_task()
+ active_streams[user["id"]] = task
+ try:
+ full_text = ""
+ async for token in stream_groq_chat(messages, model=use_model):
+ if task.cancelled():
+ break
+ full_text += token
+ yield sse({"type": "token", "text": token})
+
+ await save_message(user["id"], conv_id, "assistant", full_text)
+ yield sse({"type": "done"})
+
+ except Exception as e:
+ logger.error(f"Analysis stream error: {e}")
+ yield sse({"type": "error", "message": str(e)})
+ finally:
+ active_streams.pop(user["id"], None)
+
+ return StreamingResponse(analysis_event_gen(), media_type="text/event-stream")
+
+# Non-stream response
+else:
+ try:
+ reply = await groq_chat_sync(messages, model=use_model)
+ await save_message(user["id"], conv_id, "assistant", reply)
+ return {"reply": reply, "conversation_id": conv_id, "analysis_type": file_category.value}
+ except Exception as e:
+ logger.error(f"Analysis error: {e}")
+ raise HTTPException(500, str(e))
+@app.post("/analysis/json")
+async def analyze_file_json(req: Request, res: Response):
+ """
+ JSON body version of /analysis for programmatic use.
+ Body: { "image_base64": "...", "prompt": "...", "analysis_type": "image|code|document|auto", "content": "...", "filename": "...", "conversation_id": "...", "stream": true }
+ """
+ body = await req.json()
+
+image_b64 = body.get("image_base64")
+text_content = body.get("content")
+filename = body.get("filename", "unknown")
+prompt = body.get("prompt")
+conv_id_proposed = body.get("conversation_id")
+do_stream = body.get("stream", True)
+remember = body.get("remember", True)
+analysis_type_str = body.get("analysis_type", "auto")
+
+user = await get_user(req, res, remember)
+
+file_category = FileCategory.UNKNOWN
+image_data_b64 = None
+image_mime_type = body.get("image_mime", "image/png")
+file_text = None
+
+if image_b64:
+ clean_b64 = image_b64
+ if "," in image_b64:
+ clean_b64 = image_b64.split(",", 1)[1]
+ image_data_b64 = clean_b64.strip()
+ file_category = FileCategory.IMAGE if analysis_type_str in ("auto", "image") else FileCategory(analysis_type_str)
+elif text_content:
+ file_text = text_content[:MAX_TEXT_LENGTH]
+ if analysis_type_str and analysis_type_str != "auto":
+ try:
+ file_category = FileCategory(analysis_type_str)
+ except ValueError:
+ file_category = get_file_category(filename)
+ else:
+ file_category = get_file_category(filename)
+else:
+ raise HTTPException(400, "Either 'image_base64' or 'content' must be provided.")
+
+display_prompt = prompt or f"Analysis of {filename}"
+conv_id = await get_or_create_conversation(user_id=user["id"], proposed_id=conv_id_proposed, title=display_prompt)
+
+# Save user message
+if file_category == FileCategory.IMAGE:
+ user_msg = f"[Image Analysis] {filename}" + (f"\n{prompt}" if prompt else "")
+else:
+ language = get_language_from_extension(filename)
+ user_msg = f"[{file_category.value.title()} Analysis] {filename} ({language})" + (f"\n{prompt}" if prompt else "")
+await save_message(user["id"], conv_id, "user", user_msg)
+
+# Build messages
+if file_category == FileCategory.IMAGE:
+ if not GROQ_API_KEY:
+ raise HTTPException(500, "Groq API Key required for image analysis")
+ messages = _build_image_analysis_messages(image_data_b64, image_mime_type, prompt)
+ use_model = GROQ_VISION_MODEL
+elif file_category == FileCategory.CODE:
+ language = get_language_from_extension(filename)
+ messages = _build_code_analysis_messages(file_text, filename, language, prompt)
+ use_model = GROQ_CHAT_MODEL
+else:
+ messages = _build_document_analysis_messages(file_text, filename, prompt)
+ use_model = GROQ_CHAT_MODEL
+
+if do_stream:
+ async def analysis_json_event_gen():
+ task = asyncio.current_task()
+ active_streams[user["id"]] = task
+ try:
+ full_text = ""
+ async for token in stream_groq_chat(messages, model=use_model):
+ if task.cancelled():
+ break
+ full_text += token
+ yield sse({"type": "token", "text": token})
+ await save_message(user["id"], conv_id, "assistant", full_text)
+ yield sse({"type": "done"})
+ except Exception as e:
+ logger.error(f"Analysis JSON stream error: {e}")
+ yield sse({"type": "error", "message": str(e)})
+ finally:
+ active_streams.pop(user["id"], None)
+
+ return StreamingResponse(analysis_json_event_gen(), media_type="text/event-stream")
+else:
+ try:
+ reply = await groq_chat_sync(messages, model=use_model)
+ await save_message(user["id"], conv_id, "assistant", reply)
+ return {"reply": reply, "conversation_id": conv_id, "analysis_type": file_category.value}
+ except Exception as e:
+ logger.error(f"Analysis JSON error: {e}")
+ raise HTTPException(500, str(e))
+=========================
+
+UNIVERSAL CHAT ENDPOINT
+
+=========================
 
 @app.post("/ask/universal")
 async def ask_universal(req: Request, res: Response):
-    content_type = req.headers.get("content-type", "")
-    body = {}
+ content_type = req.headers.get("content-type", "")
+ body = {}
 
-    if "application/json" in content_type:
-        body = await req.json()
-    elif "multipart/form-data" in content_type:
-        form = await req.form()
-        body = dict(form)
-        if "file" in form:
-            file: UploadFile = form["file"]
-            content_bytes = b""
-            while chunk := await file.read(1024 * 1024): 
-                content_bytes += chunk
-                if len(content_bytes) > MAX_FILE_SIZE:
-                    raise HTTPException(413, "File too large")
-                    
-            text_content = await extract_text_safe(content_bytes)
-            file_prefix = f"\n\n[FILE CONTENT: {file.filename}]\n{text_content}\n[END FILE]\n"
-            body["prompt"] = body.get("prompt", "") + file_prefix
+if "application/json" in content_type:
+ body = await req.json()
+elif "multipart/form-data" in content_type:
+ form = await req.form()
+ body = dict(form)
+ if "file" in form:
+ file: UploadFile = form["file"]
+ content_bytes = b""
+ while chunk := await file.read(1024 * 1024):
+ content_bytes += chunk
+ if len(content_bytes) > MAX_FILE_SIZE:
+ raise HTTPException(413, "File too large")
 
-    prompt = body.get("prompt", "")
-    conv_id = body.get("conversation_id")
-    stream = body.get("stream", True)
-    remember = body.get("remember", True)
-    image_size = body.get("image_size", "1024x1024")
-    image_quality = body.get("image_quality", "medium")
+ text_content = await extract_text_safe(content_bytes)
+ file_prefix = f"\n\n[FILE CONTENT: {file.filename}]\n{text_content}\n[END FILE]\n"
+ body["prompt"] = body.get("prompt", "") + file_prefix
 
-    if not prompt:
-        raise HTTPException(400, "Prompt required")
+prompt = body.get("prompt", "")
+conv_id = body.get("conversation_id")
+stream = body.get("stream", True)
+remember = body.get("remember", True)
+image_size = body.get("image_size", "1024x1024")
+image_quality = body.get("image_quality", "medium")
 
-    user = await get_user(req, res, remember)
-    intent = _detector.detect(prompt)
+if not prompt:
+ raise HTTPException(400, "Prompt required")
 
-    is_image_request = intent.intent == IntentCategory.IMAGE_GENERATION
+user = await get_user(req, res, remember)
+intent = _detector.detect(prompt)
 
-    needs_search = intent.intent == IntentCategory.RESEARCH
-    search_keywords = ["latest", "news", "current", "price", "weather", "stock", "who is"]
-    if any(kw in prompt.lower() for kw in search_keywords):
-        needs_search = True
+is_image_request = intent.intent == IntentCategory.IMAGE_GENERATION
 
-    conv_id = await get_or_create_conversation(user_id=user["id"], proposed_id=conv_id, title=prompt)
-    await save_message(user["id"], conv_id, "user", prompt)
+needs_search = intent.intent == IntentCategory.RESEARCH
+search_keywords = ["latest", "news", "current", "price", "weather", "stock", "who is"]
+if any(kw in prompt.lower() for kw in search_keywords):
+ needs_search = True
 
-    # ==========================================
-    # IMAGE GENERATION PATH (STREAMS AS MARKDOWN)
-    # ==========================================
-    if is_image_request:
-        if stream:
-            async def image_event_gen():
-                task = asyncio.current_task()
-                active_streams[user["id"]] = task
-                try:
-                    # 1. Stream a normal text token saying it's generating
-                    yield sse({"type": "token", "text": "*Generating image...*\n\n"})
-                    
-                    # 2. Generate the image in the background
-                    image_b64 = await generate_image_openai_sync(
-                        prompt=prompt,
-                        size=image_size,
-                        quality=image_quality
-                    )
-                    
-                    # 3. Wrap it in standard Markdown image syntax
-                    md_image = f"![Generated Image](data:image/png;base64,{image_b64})"
-                    
-                    # 4. Save the markdown directly to DB so chat history renders perfectly
-                    await save_message(user["id"], conv_id, "assistant", md_image)
-                    
-                    # 5. Stream the image to frontend as a normal token!
-                    yield sse({"type": "token", "text": md_image})
-                    yield sse({"type": "done"})
-                    
-                except Exception as e:
-                    logger.error(f"Image stream error: {e}")
-                    yield sse({"type": "error", "message": str(e)})
-                finally:
-                    active_streams.pop(user["id"], None)
+conv_id = await get_or_create_conversation(user_id=user["id"], proposed_id=conv_id, title=prompt)
+await save_message(user["id"], conv_id, "user", prompt)
 
-            return StreamingResponse(image_event_gen(), media_type="text/event-stream")
-        else:
-            try:
-                image_b64 = await generate_image_openai_sync(
-                    prompt=prompt, size=image_size, quality=image_quality
-                )
-                md_image = f"![Generated Image](data:image/png;base64,{image_b64})"
-                await save_message(user["id"], conv_id, "assistant", md_image)
-                
-                return {"reply": md_image, "conversation_id": conv_id}
-            except Exception as e:
-                logger.error(f"Image generation error: {e}")
-                raise HTTPException(500, str(e))
+# ==========================================
+# IMAGE GENERATION PATH (STREAMS AS MARKDOWN)
+# ==========================================
+if is_image_request:
+ if stream:
+ async def image_event_gen():
+ task = asyncio.current_task()
+ active_streams[user["id"]] = task
+ try:
+ yield sse({"type": "token", "text": "*Generating image...*\n\n"})
 
-    # ===================
-    # TEXT/CHAT PATH
-    # ===================
-    if stream:
-        async def event_gen():
-            task = asyncio.current_task()
-            active_streams[user["id"]] = task
-            try:
-                full_text = ""
-                search_context = ""
+ image_b64 = await generate_image_openai_sync(
+ prompt=prompt,
+ size=image_size,
+ quality=image_quality
+ )
 
-                if needs_search:
-                    yield sse({"type": "token", "text": "*Searching web...*\n\n"})
-                    search_context = await perform_web_search(prompt)
+ md_image = f"![Generated Image](data:image/png;base64,{image_b64})"
 
-                history = await get_history(conv_id)
-                system_prompt = get_system_prompt(prompt)
-                if search_context:
-                    system_prompt += f"\n\nWEB SEARCH RESULTS:\n{search_context}\n\nUse these results to answer."
+ await save_message(user["id"], conv_id, "assistant", md_image)
 
-                messages = [{"role": "system", "content": system_prompt}] + history
+ yield sse({"type": "token", "text": md_image})
+ yield sse({"type": "done"})
 
-                async for token in stream_groq_chat(messages):
-                    if task.cancelled():
-                        break
-                    full_text += token
-                    yield sse({"type": "token", "text": token})
+ except Exception as e:
+ logger.error(f"Image stream error: {e}")
+ yield sse({"type": "error", "message": str(e)})
+ finally:
+ active_streams.pop(user["id"], None)
 
-                await save_message(user["id"], conv_id, "assistant", full_text)
-                yield sse({"type": "done"})
+ return StreamingResponse(image_event_gen(), media_type="text/event-stream")
+ else:
+ try:
+ image_b64 = await generate_image_openai_sync(
+ prompt=prompt, size=image_size, quality=image_quality
+ )
+ md_image = f"![Generated Image](data:image/png;base64,{image_b64})"
+ await save_message(user["id"], conv_id, "assistant", md_image)
 
-            except Exception as e:
-                logger.error(f"Stream error: {e}")
-                yield sse({"type": "error", "message": str(e)})
-            finally:
-                active_streams.pop(user["id"], None)
+ return {"reply": md_image, "conversation_id": conv_id}
+ except Exception as e:
+ logger.error(f"Image generation error: {e}")
+ raise HTTPException(500, str(e))
 
-        return StreamingResponse(event_gen(), media_type="text/event-stream")
+# ===================
+# TEXT/CHAT PATH
+# ===================
+if stream:
+ async def event_gen():
+ task = asyncio.current_task()
+ active_streams[user["id"]] = task
+ try:
+ full_text = ""
+ search_context = ""
 
-    else:
-        search_context = ""
-        if needs_search:
-            search_context = await perform_web_search(prompt)
+ if needs_search:
+ yield sse({"type": "token", "text": "*Searching web...*\n\n"})
+ search_context = await perform_web_search(prompt)
 
-        history = await get_history(conv_id)
-        system_prompt = get_system_prompt(prompt)
-        if search_context:
-            system_prompt += f"\n\nWEB SEARCH RESULTS:\n{search_context}"
+ history = await get_history(conv_id)
+ system_prompt = get_system_prompt(prompt)
+ if search_context:
+ system_prompt += f"\n\nWEB SEARCH RESULTS:\n{search_context}\n\nUse these results to answer."
 
-        messages = [{"role": "system", "content": system_prompt}] + history
+ messages = [{"role": "system", "content": system_prompt}] + history
 
-        attempt = 0
-        while attempt < GROQ_MAX_RETRIES:
-            attempt += 1
-            async with httpx.AsyncClient() as client:
-                r = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=get_groq_headers(),
-                    json={"model": GROQ_CHAT_MODEL, "messages": messages, "max_tokens": 2048}
-                )
-                if r.status_code == 429:
-                    retry_delay = _parse_retry_after(r.text)
-                    logger.warning(f"Groq 429 (non-stream). Attempt {attempt}/{GROQ_MAX_RETRIES}. Retrying in {retry_delay:.1f}s...")
-                    await asyncio.sleep(retry_delay)
-                    continue
-                r.raise_for_status()
-                reply = r.json()["choices"][0]["message"]["content"]
-                await save_message(user["id"], conv_id, "assistant", reply)
-                return {"reply": reply, "conversation_id": conv_id}
+ async for token in stream_groq_chat(messages):
+ if task.cancelled():
+ break
+ full_text += token
+ yield sse({"type": "token", "text": token})
 
-        raise HTTPException(429, "Rate limit exceeded. Please wait a minute before trying again.")
+ await save_message(user["id"], conv_id, "assistant", full_text)
+ yield sse({"type": "done"})
+
+ except Exception as e:
+ logger.error(f"Stream error: {e}")
+ yield sse({"type": "error", "message": str(e)})
+ finally:
+ active_streams.pop(user["id"], None)
+
+ return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+else:
+ search_context = ""
+ if needs_search:
+ search_context = await perform_web_search(prompt)
+
+ history = await get_history(conv_id)
+ system_prompt = get_system_prompt(prompt)
+ if search_context:
+ system_prompt += f"\n\nWEB SEARCH RESULTS:\n{search_context}"
+
+ messages = [{"role": "system", "content": system_prompt}] + history
+
+ try:
+ reply = await groq_chat_sync(messages)
+ await save_message(user["id"], conv_id, "assistant", reply)
+ return {"reply": reply, "conversation_id": conv_id}
+ except Exception as e:
+ logger.error(f"Non-stream chat error: {e}")
+ raise HTTPException(429, "Rate limit exceeded. Please wait a minute before trying again.")
+=========================
+
+CHAT MANAGEMENT ENDPOINTS
+
+=========================
 
 @app.post("/newchat")
 async def new_chat(req: Request, res: Response):
-    user = await get_user(req, res)
-    new_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-    await _execute_supabase_with_retry(
-        supabase.table("conversations").insert({
-            "id": new_id, "user_id": user["id"], "title": "New Chat",
-            "created_at": now, "updated_at": now,
-        })
-    )
-    return {"conversation_id": new_id, "status": "created"}
+ user = await get_user(req, res)
+ new_id = str(uuid.uuid4())
+ now = datetime.now(timezone.utc).isoformat()
+ await _execute_supabase_with_retry(
+ supabase.table("conversations").insert({
+ "id": new_id, "user_id": user["id"], "title": "New Chat",
+ "created_at": now, "updated_at": now,
+ })
+ )
+ return {"conversation_id": new_id, "status": "created"}
+
+@app.delete("/chats/{chat_id}")
+async def delete_chat(chat_id: str, req: Request, res: Response):
+ """
+ Delete a conversation and all its messages.
+ Verifies ownership before deletion.
+ """
+ user = await get_user(req, res)
+
+# Verify the chat belongs to this user
+check = await _execute_supabase_with_retry(
+ supabase.table("conversations")
+ .select("id, user_id")
+ .eq("id", chat_id)
+ .eq("user_id", user["id"])
+ .limit(1)
+)
+
+if not check.data:
+ logger.warning(f"DELETE /chats/{chat_id}: Chat not found or not owned by user {user['id']}")
+ raise HTTPException(404, "Chat not found")
+
+# Delete all messages in the conversation first
+try:
+ await _execute_supabase_with_retry(
+ supabase.table("messages")
+ .delete()
+ .eq("conversation_id", chat_id)
+ )
+except Exception as e:
+ logger.error(f"Failed to delete messages for chat {chat_id}: {e}")
+ # Continue to try deleting the conversation itself
+
+# Delete the conversation
+try:
+ await _execute_supabase_with_retry(
+ supabase.table("conversations")
+ .delete()
+ .eq("id", chat_id)
+ .eq("user_id", user["id"])
+ )
+except Exception as e:
+ logger.error(f"Failed to delete chat {chat_id}: {e}")
+ raise HTTPException(500, "Failed to delete chat")
+
+logger.info(f"Deleted chat {chat_id} and its messages for user {user['id']}")
+return {"status": "deleted", "conversation_id": chat_id}
+@app.get("/chats")
+async def list_chats(req: Request, res: Response, limit: int = Query(50, le=100), offset: int = Query(0, ge=0)):
+ user = await get_user(req, res)
+ result = await _execute_supabase_with_retry(
+ supabase.table("conversations")
+ .select("*")
+ .eq("user_id", user["id"])
+ .order("updated_at", desc=True)
+ .range(offset, offset + limit - 1)
+ )
+ return {"chats": result.data}
+
+@app.get("/chat/{conversation_id}/messages")
+async def get_messages(conversation_id: str):
+ msgs = await _execute_supabase_with_retry(
+ supabase.table("messages")
+ .select("role, content, created_at")
+ .eq("conversation_id", conversation_id)
+ .order("created_at", desc=False)
+ )
+ return {"messages": msgs.data}
+
+=========================
+
+TTS / STT ENDPOINTS
+
+=========================
 
 @app.post("/tts")
 async def text_to_speech(req: Request):
-    data = await req.json()
-    text = data.get("text")
-    voice = data.get("voice", "alloy")
+ data = await req.json()
+ text = data.get("text")
+ voice = data.get("voice", "alloy")
 
-    allowed_voices = ["alloy", "onyx", "nova", "shimmer", "echo", "fable"]
-    if voice not in allowed_voices:
-        voice = "alloy"
+allowed_voices = ["alloy", "onyx", "nova", "shimmer", "echo", "fable"]
+if voice not in allowed_voices:
+ voice = "alloy"
 
-    if not text:
-        raise HTTPException(400, "text required")
-    if not OPENAI_API_KEY:
-        raise HTTPException(500, "Missing OpenAI API Key")
+if not text:
+ raise HTTPException(400, "text required")
+if not OPENAI_API_KEY:
+ raise HTTPException(500, "Missing OpenAI API Key")
 
-    async def stream_audio():
-        async with httpx.AsyncClient(timeout=60) as client:
-            async with client.stream(
-                "POST", 
-                "https://api.openai.com/v1/audio/speech",
-                headers=get_openai_headers(),
-                json={
-                    "model": OPENAI_TTS_MODEL, 
-                    "voice": voice, 
-                    "input": text, 
-                    "response_format": "mp3"
-                }
-            ) as response:
-                if response.status_code != 200:
-                    error_body = await response.aread()
-                    logger.error(f"OpenAI TTS Error {response.status_code}: {error_body.decode()}")
-                    return
-                async for chunk in response.aiter_bytes():
-                    yield chunk
+async def stream_audio():
+ async with httpx.AsyncClient(timeout=60) as client:
+ async with client.stream(
+ "POST",
+ "https://api.openai.com/v1/audio/speech",
+ headers=get_openai_headers(),
+ json={
+ "model": OPENAI_TTS_MODEL,
+ "voice": voice,
+ "input": text,
+ "response_format": "mp3"
+ }
+ ) as response:
+ if response.status_code != 200:
+ error_body = await response.aread()
+ logger.error(f"OpenAI TTS Error {response.status_code}: {error_body.decode()}")
+ return
+ async for chunk in response.aiter_bytes():
+ yield chunk
 
-    return StreamingResponse(stream_audio(), media_type="audio/mpeg")
-
+return StreamingResponse(stream_audio(), media_type="audio/mpeg")
 @app.get("/tts/voices")
 async def get_voices():
-    return {
-        "voices": [
-            {"id": "alloy", "name": "Alloy"},
-            {"id": "fable", "name": "Fable"}
-        ]
-    }
+ return {
+ "voices": [
+ {"id": "alloy", "name": "Alloy"},
+ {"id": "fable", "name": "Fable"},
+ {"id": "onyx", "name": "Onyx"},
+ {"id": "nova", "name": "Nova"},
+ {"id": "shimmer", "name": "Shimmer"},
+ {"id": "echo", "name": "Echo"}
+ ]
+ }
 
 @app.post("/stt")
 async def speech_to_text(file: UploadFile = File(...)):
-    if not GROQ_API_KEY:
-        raise HTTPException(500, "Missing Groq API Key")
-    
-    allowed_types = ["audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav", "audio/webm", "audio/ogg", "audio/flac", "audio/m4a", "video/mp4", "video/webm"]
-    if file.content_type and file.content_type not in allowed_types:
-        logger.warning(f"STT: Unexpected content type: {file.content_type}")
-    
-    content = b""
-    while chunk := await file.read(1024 * 1024):
-        content += chunk
-        if len(content) > 25 * 1024 * 1024:
-            raise HTTPException(400, "Audio file too large. Maximum size is 25MB.")
-    
-    if len(content) == 0:
-        raise HTTPException(400, "Empty audio file")
-    
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            files = {"file": (file.filename or "audio.mp3", content, file.content_type or "audio/mpeg")}
-            data = {"model": GROQ_STT_MODEL, "response_format": "json"}
-            
-            r = await client.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers=get_groq_headers_multipart(), files=files, data=data
-            )
-            if r.status_code != 200:
-                error_detail = r.text
-                logger.error(f"Groq STT Error {r.status_code}: {error_detail}")
-                raise HTTPException(status_code=r.status_code, detail=f"Groq STT failed: {error_detail}")
-            
-            result = r.json()
-            return {"text": result.get("text", ""), "model": GROQ_STT_MODEL, "provider": "groq"}
-            
-    except httpx.TimeoutException:
-        raise HTTPException(504, "Speech transcription timed out")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"STT Error: {e}")
-        raise HTTPException(500, f"Speech to text failed: {str(e)}")
+ if not GROQ_API_KEY:
+ raise HTTPException(500, "Missing Groq API Key")
 
-# =========================
-# UTILITIES
-# =========================
-@app.get("/chat/{conversation_id}/messages")
-async def get_messages(conversation_id: str):
-    msgs = await _execute_supabase_with_retry(
-        supabase.table("messages")
-        .select("role, content, created_at")
-        .eq("conversation_id", conversation_id)
-        .order("created_at", desc=False)
-    )
-    return {"messages": msgs.data}
+allowed_types = ["audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav", "audio/webm", "audio/ogg", "audio/flac", "audio/m4a", "video/mp4", "video/webm"]
+if file.content_type and file.content_type not in allowed_types:
+ logger.warning(f"STT: Unexpected content type: {file.content_type}")
 
-@app.get("/chats")
-async def list_chats(req: Request, res: Response, limit: int = Query(50, le=100), offset: int = Query(0, ge=0)):
-    user = await get_user(req, res)
-    result = await _execute_supabase_with_retry(
-        supabase.table("conversations")
-        .select("*")
-        .eq("user_id", user["id"])
-        .order("updated_at", desc=True)
-        .range(offset, offset + limit - 1)
-    )
-    return {"chats": result.data}
+content = b""
+while chunk := await file.read(1024 * 1024):
+ content += chunk
+ if len(content) > 25 * 1024 * 1024:
+ raise HTTPException(400, "Audio file too large. Maximum size is 25MB.")
+
+if len(content) == 0:
+ raise HTTPException(400, "Empty audio file")
+
+try:
+ async with httpx.AsyncClient(timeout=60) as client:
+ files = {"file": (file.filename or "audio.mp3", content, file.content_type or "audio/mpeg")}
+ data = {"model": GROQ_STT_MODEL, "response_format": "json"}
+
+ r = await client.post(
+ "https://api.groq.com/openai/v1/audio/transcriptions",
+ headers=get_groq_headers_multipart(), files=files, data=data
+ )
+ if r.status_code != 200:
+ error_detail = r.text
+ logger.error(f"Groq STT Error {r.status_code}: {error_detail}")
+ raise HTTPException(status_code=r.status_code, detail=f"Groq STT failed: {error_detail}")
+
+ result = r.json()
+ return {"text": result.get("text", ""), "model": GROQ_STT_MODEL, "provider": "groq"}
+
+except httpx.TimeoutException:
+ raise HTTPException(504, "Speech transcription timed out")
+except HTTPException:
+ raise
+except Exception as e:
+ logger.error(f"STT Error: {e}")
+ raise HTTPException(500, f"Speech to text failed: {str(e)}")
+=========================
+
+SESSION ENDPOINTS
+
+=========================
 
 @app.post("/session/logout")
 async def logout(req: Request, res: Response):
-    clear_session_cookies(res)
-    return {"status": "logged_out"}
+ clear_session_cookies(res)
+ return {"status": "logged_out"}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+=========================
+
+MAIN
+
+=========================
+
+if name == "main":
+ import uvicorn
+ uvicorn.run(app, host="0.0.0.0", port=8080)
