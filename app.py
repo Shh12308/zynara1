@@ -1,6 +1,3 @@
-The entire file lost all its indentation when you copied it. Every function, every `if` block, every `class` — everything is flush-left, which is why Python can't parse it. Here's the complete file with correct indentation:
-
-```python
 import os
 import re
 import json
@@ -1373,8 +1370,3 @@ async def logout(req: Request, res: Response):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
-```
-
-**What happened:** When you copied the previous code into your editor/deployment, all indentation was stripped — every line became column 0. Python is indentation-sensitive, so it couldn't parse any `if`, `def`, `class`, `async def`, `while`, `for`, `try`, `with` block. The error pointed at line 862 because that's where the parser first hit an `if` with no indented body below it.
-
-**What to watch for when copying:** If you're pasting into a deployment panel (like Render), make sure the paste preserves leading spaces/tabs. If your editor or terminal strips indentation, use `curl` or a direct file upload instead of copy-paste. You can also verify locally with `python -c "import py_compile; py_compile.compile('app.py', doraise=True)"` before deploying.
