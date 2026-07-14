@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 import base64
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from enum import Enum
@@ -54,7 +54,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="HeloxAi Lite",
     description="Text, Code, Math, Research, Image Generation & File Analysis Backend",
-    version="3.8.0"
+    version="3.7.0"
 )
 
 # =========================
@@ -207,207 +207,6 @@ async def extract_text_safe(content: bytes) -> str:
 
 def _is_image_mime(mime: str) -> bool:
     return mime and mime.startswith("image/")
-
-# =========================
-# TIMEZONE DATABASE
-# =========================
-COUNTRY_TO_TIMEZONES: Dict[str, List[Dict[str, str]]] = {
-    "united states": [
-        {"city": "New York", "tz": "America/New_York", "flag": "🇺🇸", "abbr": "EST/EDT"},
-        {"city": "Chicago", "tz": "America/Chicago", "flag": "🇺🇸", "abbr": "CST/CDT"},
-        {"city": "Denver", "tz": "America/Denver", "flag": "🇺🇸", "abbr": "MST/MDT"},
-        {"city": "Los Angeles", "tz": "America/Los_Angeles", "flag": "🇺🇸", "abbr": "PST/PDT"},
-        {"city": "Anchorage", "tz": "America/Anchorage", "flag": "🇺🇸", "abbr": "AKST/AKDT"},
-        {"city": "Honolulu", "tz": "Pacific/Honolulu", "flag": "🇺🇸", "abbr": "HST"},
-    ],
-    "us": [
-        {"city": "New York", "tz": "America/New_York", "flag": "🇺🇸", "abbr": "EST/EDT"},
-        {"city": "Chicago", "tz": "America/Chicago", "flag": "🇺🇸", "abbr": "CST/CDT"},
-        {"city": "Denver", "tz": "America/Denver", "flag": "🇺🇸", "abbr": "MST/MDT"},
-        {"city": "Los Angeles", "tz": "America/Los_Angeles", "flag": "🇺🇸", "abbr": "PST/PDT"},
-    ],
-    "usa": [
-        {"city": "New York", "tz": "America/New_York", "flag": "🇺🇸", "abbr": "EST/EDT"},
-        {"city": "Chicago", "tz": "America/Chicago", "flag": "🇺🇸", "abbr": "CST/CDT"},
-        {"city": "Denver", "tz": "America/Denver", "flag": "🇺🇸", "abbr": "MST/MDT"},
-        {"city": "Los Angeles", "tz": "America/Los_Angeles", "flag": "🇺🇸", "abbr": "PST/PDT"},
-    ],
-    "uk": [
-        {"city": "London", "tz": "Europe/London", "flag": "🇬🇧", "abbr": "GMT/BST", "country": "United Kingdom"},
-    ],
-    "united kingdom": [
-        {"city": "London", "tz": "Europe/London", "flag": "🇬🇧", "abbr": "GMT/BST", "country": "United Kingdom"},
-    ],
-    "england": [
-        {"city": "London", "tz": "Europe/London", "flag": "🇬🇧", "abbr": "GMT/BST", "country": "England"},
-    ],
-    "japan": [
-        {"city": "Tokyo", "tz": "Asia/Tokyo", "flag": "🇯🇵", "abbr": "JST", "country": "Japan"},
-    ],
-    "china": [
-        {"city": "Beijing", "tz": "Asia/Shanghai", "flag": "🇨🇳", "abbr": "CST", "country": "China"},
-        {"city": "Shanghai", "tz": "Asia/Shanghai", "flag": "🇨🇳", "abbr": "CST", "country": "China"},
-        {"city": "Hong Kong", "tz": "Asia/Hong_Kong", "flag": "🇭🇰", "abbr": "HKT", "country": "Hong Kong"},
-    ],
-    "india": [
-        {"city": "New Delhi", "tz": "Asia/Kolkata", "flag": "🇮🇳", "abbr": "IST", "country": "India"},
-        {"city": "Mumbai", "tz": "Asia/Kolkata", "flag": "🇮🇳", "abbr": "IST", "country": "India"},
-    ],
-    "australia": [
-        {"city": "Sydney", "tz": "Australia/Sydney", "flag": "🇦🇺", "abbr": "AEST/AEDT", "country": "Australia"},
-        {"city": "Melbourne", "tz": "Australia/Melbourne", "flag": "🇦🇺", "abbr": "AEST/AEDT", "country": "Australia"},
-        {"city": "Perth", "tz": "Australia/Perth", "flag": "🇦🇺", "abbr": "AWST", "country": "Australia"},
-    ],
-    "germany": [
-        {"city": "Berlin", "tz": "Europe/Berlin", "flag": "🇩🇪", "abbr": "CET/CEST", "country": "Germany"},
-    ],
-    "france": [
-        {"city": "Paris", "tz": "Europe/Paris", "flag": "🇫🇷", "abbr": "CET/CEST", "country": "France"},
-    ],
-    "italy": [
-        {"city": "Rome", "tz": "Europe/Rome", "flag": "🇮🇹", "abbr": "CET/CEST", "country": "Italy"},
-    ],
-    "spain": [
-        {"city": "Madrid", "tz": "Europe/Madrid", "flag": "🇪🇸", "abbr": "CET/CEST", "country": "Spain"},
-    ],
-    "brazil": [
-        {"city": "São Paulo", "tz": "America/Sao_Paulo", "flag": "🇧🇷", "abbr": "BRT", "country": "Brazil"},
-        {"city": "Rio de Janeiro", "tz": "America/Sao_Paulo", "flag": "🇧🇷", "abbr": "BRT", "country": "Brazil"},
-    ],
-    "canada": [
-        {"city": "Toronto", "tz": "America/Toronto", "flag": "🇨🇦", "abbr": "EST/EDT", "country": "Canada"},
-        {"city": "Vancouver", "tz": "America/Vancouver", "flag": "🇨🇦", "abbr": "PST/PDT", "country": "Canada"},
-    ],
-    "mexico": [
-        {"city": "Mexico City", "tz": "America/Mexico_City", "flag": "🇲🇽", "abbr": "CST/CDT", "country": "Mexico"},
-    ],
-    "south korea": [
-        {"city": "Seoul", "tz": "Asia/Seoul", "flag": "🇰🇷", "abbr": "KST", "country": "South Korea"},
-    ],
-    "korea": [
-        {"city": "Seoul", "tz": "Asia/Seoul", "flag": "🇰🇷", "abbr": "KST", "country": "South Korea"},
-    ],
-    "russia": [
-        {"city": "Moscow", "tz": "Europe/Moscow", "flag": "🇷🇺", "abbr": "MSK", "country": "Russia"},
-    ],
-    "singapore": [
-        {"city": "Singapore", "tz": "Asia/Singapore", "flag": "🇸🇬", "abbr": "SGT", "country": "Singapore"},
-    ],
-    "uae": [
-        {"city": "Dubai", "tz": "Asia/Dubai", "flag": "🇦🇪", "abbr": "GST", "country": "UAE"},
-    ],
-    "dubai": [
-        {"city": "Dubai", "tz": "Asia/Dubai", "flag": "🇦🇪", "abbr": "GST", "country": "UAE"},
-    ],
-    "saudi arabia": [
-        {"city": "Riyadh", "tz": "Asia/Riyadh", "flag": "🇸🇦", "abbr": "AST", "country": "Saudi Arabia"},
-    ],
-    "turkey": [
-        {"city": "Istanbul", "tz": "Europe/Istanbul", "flag": "🇹🇷", "abbr": "TRT", "country": "Turkey"},
-    ],
-    "egypt": [
-        {"city": "Cairo", "tz": "Africa/Cairo", "flag": "🇪🇬", "abbr": "EET", "country": "Egypt"},
-    ],
-    "south africa": [
-        {"city": "Johannesburg", "tz": "Africa/Johannesburg", "flag": "🇿🇦", "abbr": "SAST", "country": "South Africa"},
-    ],
-    "nigeria": [
-        {"city": "Lagos", "tz": "Africa/Lagos", "flag": "🇳🇬", "abbr": "WAT", "country": "Nigeria"},
-    ],
-    "thailand": [
-        {"city": "Bangkok", "tz": "Asia/Bangkok", "flag": "🇹🇭", "abbr": "ICT", "country": "Thailand"},
-    ],
-    "vietnam": [
-        {"city": "Ho Chi Minh City", "tz": "Asia/Ho_Chi_Minh", "flag": "🇻🇳", "abbr": "ICT", "country": "Vietnam"},
-    ],
-    "indonesia": [
-        {"city": "Jakarta", "tz": "Asia/Jakarta", "flag": "🇮🇩", "abbr": "WIB", "country": "Indonesia"},
-    ],
-    "philippines": [
-        {"city": "Manila", "tz": "Asia/Manila", "flag": "🇵🇭", "abbr": "PHT", "country": "Philippines"},
-    ],
-    "malaysia": [
-        {"city": "Kuala Lumpur", "tz": "Asia/Kuala_Lumpur", "flag": "🇲🇾", "abbr": "MYT", "country": "Malaysia"},
-    ],
-    "new zealand": [
-        {"city": "Auckland", "tz": "Pacific/Auckland", "flag": "🇳🇿", "abbr": "NZST/NZDT", "country": "New Zealand"},
-    ],
-    "argentina": [
-        {"city": "Buenos Aires", "tz": "America/Argentina/Buenos_Aires", "flag": "🇦🇷", "abbr": "ART", "country": "Argentina"},
-    ],
-    "colombia": [
-        {"city": "Bogotá", "tz": "America/Bogota", "flag": "🇨🇴", "abbr": "COT", "country": "Colombia"},
-    ],
-    "chile": [
-        {"city": "Santiago", "tz": "America/Santiago", "flag": "🇨🇱", "abbr": "CLT/CLST", "country": "Chile"},
-    ],
-    "peru": [
-        {"city": "Lima", "tz": "America/Lima", "flag": "🇵🇪", "abbr": "PET", "country": "Peru"},
-    ],
-    "netherlands": [
-        {"city": "Amsterdam", "tz": "Europe/Amsterdam", "flag": "🇳🇱", "abbr": "CET/CEST", "country": "Netherlands"},
-    ],
-    "switzerland": [
-        {"city": "Zurich", "tz": "Europe/Zurich", "flag": "🇨🇭", "abbr": "CET/CEST", "country": "Switzerland"},
-    ],
-    "sweden": [
-        {"city": "Stockholm", "tz": "Europe/Stockholm", "flag": "🇸🇪", "abbr": "CET/CEST", "country": "Sweden"},
-    ],
-    "norway": [
-        {"city": "Oslo", "tz": "Europe/Oslo", "flag": "🇳🇴", "abbr": "CET/CEST", "country": "Norway"},
-    ],
-    "denmark": [
-        {"city": "Copenhagen", "tz": "Europe/Copenhagen", "flag": "🇩🇰", "abbr": "CET/CEST", "country": "Denmark"},
-    ],
-    "finland": [
-        {"city": "Helsinki", "tz": "Europe/Helsinki", "flag": "🇫🇮", "abbr": "EET/EEST", "country": "Finland"},
-    ],
-    "poland": [
-        {"city": "Warsaw", "tz": "Europe/Warsaw", "flag": "🇵🇱", "abbr": "CET/CEST", "country": "Poland"},
-    ],
-    "portugal": [
-        {"city": "Lisbon", "tz": "Europe/Lisbon", "flag": "🇵🇹", "abbr": "WET/WEST", "country": "Portugal"},
-    ],
-    "greece": [
-        {"city": "Athens", "tz": "Europe/Athens", "flag": "🇬🇷", "abbr": "EET/EEST", "country": "Greece"},
-    ],
-    "israel": [
-        {"city": "Tel Aviv", "tz": "Asia/Jerusalem", "flag": "🇮🇱", "abbr": "IST", "country": "Israel"},
-    ],
-    "pakistan": [
-        {"city": "Karachi", "tz": "Asia/Karachi", "flag": "🇵🇰", "abbr": "PKT", "country": "Pakistan"},
-    ],
-    "bangladesh": [
-        {"city": "Dhaka", "tz": "Asia/Dhaka", "flag": "🇧🇩", "abbr": "BST", "country": "Bangladesh"},
-    ],
-    "iran": [
-        {"city": "Tehran", "tz": "Asia/Tehran", "flag": "🇮🇷", "abbr": "IRST", "country": "Iran"},
-    ],
-    "iraq": [
-        {"city": "Baghdad", "tz": "Asia/Baghdad", "flag": "🇮🇶", "abbr": "AST", "country": "Iraq"},
-    ],
-    "jamaica": [
-        {"city": "Kingston", "tz": "America/Jamaica", "flag": "🇯🇲", "abbr": "EST", "country": "Jamaica"},
-    ],
-    "haiti": [
-        {"city": "Port-au-Prince", "tz": "America/Port-au-Prince", "flag": "🇭🇹", "abbr": "EST", "country": "Haiti"},
-    ],
-    "cuba": [
-        {"city": "Havana", "tz": "America/Havana", "flag": "🇨🇺", "abbr": "CST", "country": "Cuba"},
-    ],
-    "kenya": [
-        {"city": "Nairobi", "tz": "Africa/Nairobi", "flag": "🇰🇪", "abbr": "EAT", "country": "Kenya"},
-    ],
-    "ethiopia": [
-        {"city": "Addis Ababa", "tz": "Africa/Addis_Ababa", "flag": "🇪🇹", "abbr": "EAT", "country": "Ethiopia"},
-    ],
-    "ghana": [
-        {"city": "Accra", "tz": "Africa/Accra", "flag": "🇬🇭", "abbr": "GMT", "country": "Ghana"},
-    ],
-    "morocco": [
-        {"city": "Casablanca", "tz": "Africa/Casablanca", "flag": "🇲🇦", "abbr": "WET", "country": "Morocco"},
-    ],
-    "taiwan": [
 
 # =========================
 # AUTH SYSTEM
