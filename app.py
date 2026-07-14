@@ -1,3 +1,6 @@
+The entire file lost all its indentation when you copied it. Every function, every `if` block, every `class` — everything is flush-left, which is why Python can't parse it. Here's the complete file with correct indentation:
+
+```python
 import os
 import re
 import json
@@ -356,14 +359,14 @@ Analyze the provided code thoroughly:
 2. **Architecture:** How is it structured? Patterns used?
 3. **Quality Assessment:** Rate code quality (1-10) with justification
 4. **Issues Found:**
-   - 🔴 **Critical:** Bugs, security vulnerabilities, crashes
-   - 🟡 **Warnings:** Bad practices, performance issues, maintainability
-   - 🟢 **Suggestions:** Improvements, modernizations, best practices
+   - Critical: Bugs, security vulnerabilities, crashes
+   - Warnings: Bad practices, performance issues, maintainability
+   - Suggestions: Improvements, modernizations, best practices
 5. **Security Review:** Any vulnerabilities (XSS, injection, auth issues, etc.)
 6. **Performance:** Any bottlenecks or inefficiencies
 7. **Refactored Version:** Provide an improved version of the code with fixes applied
 
-Be specific — reference line numbers or code sections. Provide working improved code."""
+Be specific - reference line numbers or code sections. Provide working improved code."""
 
 DOCUMENT_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, an expert document analyst powered by Llama 3.3 70B.
 
@@ -486,7 +489,7 @@ class AnalysisRequest(BaseModel):
     conversation_id: Optional[str] = None
     stream: bool = True
     remember: bool = True
-    analysis_type: Optional[str] = None  # "image", "code", "document", "auto"
+    analysis_type: Optional[str] = None
 
 # =========================
 # HELPERS
@@ -740,7 +743,6 @@ async def generate_image_openai_sync(prompt: str, size: str = "1024x1024", quali
 # =========================
 # ANALYSIS HELPERS
 # =========================
-
 def _build_image_analysis_messages(image_b64: str, mime_type: str, user_prompt: Optional[str]) -> list:
     """Build messages for vision model image analysis."""
     user_content = [
@@ -766,628 +768,613 @@ def _build_code_analysis_messages(code_text: str, filename: str, language: str, 
     user_content = f"""{instruction}
 
 ```{language.lower()}
-{code_text} Provide a thorough code review covering: bugs, security issues, performance, style, and an improved version if needed."""
+{code_text}
+```
 
-return [
- {"role": "system", "content": CODE_ANALYSIS_SYSTEM_PROMPT},
- {"role": "user", "content": user_content}
-]
+Provide a thorough code review covering: bugs, security issues, performance, style, and an improved version if needed."""
+    return [
+        {"role": "system", "content": CODE_ANALYSIS_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content}
+    ]
+
 def _build_document_analysis_messages(doc_text: str, filename: str, user_prompt: Optional[str]) -> list:
- """Build messages for document analysis."""
- instruction = user_prompt or f"Analyze the content from the file {filename}."
- user_content = f"""{instruction}
+    """Build messages for document analysis."""
+    instruction = user_prompt or f"Analyze the content from the file `{filename}`."
+    user_content = f"""{instruction}
 
 --- FILE CONTENT START ---
 {doc_text}
 --- FILE CONTENT END ---
 
 Provide a thorough analysis: summary, key points, structure, issues, and recommendations."""
+    return [
+        {"role": "system", "content": DOCUMENT_ANALYSIS_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content}
+    ]
 
-return [
- {"role": "system", "content": DOCUMENT_ANALYSIS_SYSTEM_PROMPT},
- {"role": "user", "content": user_content}
-]
-
+# =========================
+# ENDPOINTS
+# =========================
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
- return {
- "status": "running",
- "service": "HeloxAi Lite",
- "version": "3.7.0",
- "models": {
- "chat": GROQ_CHAT_MODEL,
- "vision": GROQ_VISION_MODEL,
- "tts": OPENAI_TTS_MODEL,
- "stt": GROQ_STT_MODEL,
- "image": OPENAI_IMAGE_MODEL
- },
- "features": [
- "chat", "code", "math", "web_search", "tts", "stt",
- "image_generation", "image_analysis", "code_analysis", "document_analysis"
- ],
- "endpoints": {
- "chat": "POST /ask/universal",
- "new_chat": "POST /newchat",
- "analysis": "POST /analysis",
- "delete_chat": "DELETE /chats/{chat_id}",
- "list_chats": "GET /chats",
- "messages": "GET /chat/{conversation_id}/messages",
- "tts": "POST /tts",
- "stt": "POST /stt",
- "logout": "POST /session/logout"
- }
- }
+    return {
+        "status": "running",
+        "service": "HeloxAi Lite",
+        "version": "3.7.0",
+        "models": {
+            "chat": GROQ_CHAT_MODEL,
+            "vision": GROQ_VISION_MODEL,
+            "tts": OPENAI_TTS_MODEL,
+            "stt": GROQ_STT_MODEL,
+            "image": OPENAI_IMAGE_MODEL
+        },
+        "features": [
+            "chat", "code", "math", "web_search", "tts", "stt",
+            "image_generation", "image_analysis", "code_analysis", "document_analysis"
+        ],
+        "endpoints": {
+            "chat": "POST /ask/universal",
+            "new_chat": "POST /newchat",
+            "analysis": "POST /analysis",
+            "analysis_json": "POST /analysis/json",
+            "delete_chat": "DELETE /chats/{chat_id}",
+            "list_chats": "GET /chats",
+            "messages": "GET /chat/{conversation_id}/messages",
+            "tts": "POST /tts",
+            "stt": "POST /stt",
+            "logout": "POST /session/logout"
+        }
+    }
 
-
-
+# =========================
+# ANALYSIS ENDPOINT (MULTIPART)
+# =========================
 @app.post("/analysis")
 async def analyze_file(
- req: Request,
- res: Response,
- file: Optional[UploadFile] = File(None),
- prompt: Optional[str] = Form(None),
- conversation_id: Optional[str] = Form(None),
- stream: bool = Form(True),
- remember: bool = Form(True),
- analysis_type: Optional[str] = Form(None),
- image_base64: Optional[str] = Form(None),
- image_mime: Optional[str] = Form("image/png"),
+    req: Request,
+    res: Response,
+    file: Optional[UploadFile] = File(None),
+    prompt: Optional[str] = Form(None),
+    conversation_id: Optional[str] = Form(None),
+    stream: bool = Form(True),
+    remember: bool = Form(True),
+    analysis_type: Optional[str] = Form(None),
+    image_base64: Optional[str] = Form(None),
+    image_mime: Optional[str] = Form("image/png"),
 ):
- """
- Analyze images, code files, or documents.
+    """
+    Analyze images, code files, or documents via multipart form data.
+    - file: Upload a file (image, code, document)
+    - image_base64: Alternatively, send a base64-encoded image string
+    - image_mime: MIME type for base64 image (default: image/png)
+    - prompt: Custom analysis instruction (optional)
+    - conversation_id: Link analysis to a conversation (optional)
+    - stream: Stream the response (default: true)
+    - analysis_type: Force type: "image", "code", "document", or "auto"
+    """
+    user = await get_user(req, res, remember)
 
-Accepts multipart form data with:
-- file: Upload a file (image, code, document)
-- image_base64: Alternatively, send a base64-encoded image string
-- image_mime: MIME type for base64 image (default: image/png)
-- prompt: Custom analysis instruction (optional)
-- conversation_id: Link analysis to a conversation (optional)
-- stream: Stream the response (default: true)
-- analysis_type: Force analysis type: "image", "code", "document", or "auto" (default: auto-detect)
-"""
-user = await get_user(req, res, remember)
+    image_data_b64 = None
+    image_mime_type = image_mime or "image/png"
+    file_text_content = None
+    file_filename = "unknown"
+    file_category = FileCategory.UNKNOWN
 
-# Determine what we're analyzing
-image_data_b64 = None
-image_mime_type = image_mime or "image/png"
-file_text_content = None
-file_filename = "unknown"
-file_category = FileCategory.UNKNOWN
+    # Priority 1: Explicit base64 image
+    if image_base64:
+        clean_b64 = image_base64
+        if "," in image_base64:
+            clean_b64 = image_base64.split(",", 1)[1]
+        image_data_b64 = clean_b64.strip()
+        file_category = FileCategory.IMAGE
+        logger.info(f"Analysis: received base64 image ({len(image_data_b64)} chars)")
 
-# Priority 1: Explicit base64 image
-if image_base64:
- # Strip data URI prefix if present
- clean_b64 = image_base64
- if "," in image_base64:
- clean_b64 = image_base64.split(",", 1)[1]
- image_data_b64 = clean_b64.strip()
- file_category = FileCategory.IMAGE
- logger.info(f"Analysis: received base64 image ({len(image_data_b64)} chars)")
+    # Priority 2: Uploaded file
+    elif file and file.filename:
+        file_filename = file.filename
+        content_bytes = b""
+        while chunk := await file.read(1024 * 1024):
+            content_bytes += chunk
+            if len(content_bytes) > MAX_FILE_SIZE:
+                raise HTTPException(413, f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB.")
 
-# Priority 2: Uploaded file
-elif file and file.filename:
- file_filename = file.filename
- content_bytes = b""
- while chunk := await file.read(1024 * 1024):
- content_bytes += chunk
- if len(content_bytes) > MAX_FILE_SIZE:
- raise HTTPException(413, f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB.")
+        if len(content_bytes) == 0:
+            raise HTTPException(400, "Empty file uploaded.")
 
- if len(content_bytes) == 0:
- raise HTTPException(400, "Empty file uploaded.")
+        if analysis_type and analysis_type != "auto":
+            try:
+                file_category = FileCategory(analysis_type)
+            except ValueError:
+                file_category = get_file_category(file_filename)
+        else:
+            file_category = get_file_category(file_filename)
 
- # Determine category
- if analysis_type and analysis_type != "auto":
- try:
- file_category = FileCategory(analysis_type)
- except ValueError:
- file_category = get_file_category(file_filename)
- else:
- file_category = get_file_category(file_filename)
+        if file.content_type and _is_image_mime(file.content_type):
+            file_category = FileCategory.IMAGE
 
- # Override with MIME check for images
- if file.content_type and _is_image_mime(file.content_type):
- file_category = FileCategory.IMAGE
+        if file_category == FileCategory.IMAGE:
+            image_data_b64 = base64.b64encode(content_bytes).decode()
+            image_mime_type = file.content_type or "image/png"
+            logger.info(f"Analysis: uploaded image file: {file_filename}")
+        else:
+            file_text_content = await extract_text_safe(content_bytes)
+            if not file_text_content.strip() or file_text_content.strip() == "[Binary or unreadable content]":
+                raise HTTPException(400, f"Could not extract text from file: {file_filename}. For images, ensure the file is a valid image format.")
+            logger.info(f"Analysis: uploaded {file_category.value} file: {file_filename} ({len(file_text_content)} chars)")
+    else:
+        raise HTTPException(400, "Either 'file' or 'image_base64' must be provided.")
 
- if file_category == FileCategory.IMAGE:
- image_data_b64 = base64.b64encode(content_bytes).decode()
- image_mime_type = file.content_type or "image/png"
- logger.info(f"Analysis: uploaded image file: {file_filename}")
- else:
- file_text_content = await extract_text_safe(content_bytes)
- if not file_text_content.strip() or file_text_content.strip() == "[Binary or unreadable content]":
- raise HTTPException(400, f"Could not extract text from file: {file_filename}. For images, ensure the file is a valid image format.")
- logger.info(f"Analysis: uploaded {file_category.value} file: {file_filename} ({len(file_text_content)} chars)")
-else:
- raise HTTPException(400, "Either 'file' or 'image_base64' must be provided.")
+    display_prompt = prompt or f"Analysis of {file_filename}"
+    conv_id = await get_or_create_conversation(user_id=user["id"], proposed_id=conversation_id, title=display_prompt)
 
-# Build the display prompt for conversation title
-display_prompt = prompt or f"Analysis of {file_filename}"
-conv_id = await get_or_create_conversation(user_id=user["id"], proposed_id=conversation_id, title=display_prompt)
+    if file_category == FileCategory.IMAGE:
+        user_msg = f"[Image Analysis] {file_filename if file and file.filename else 'Base64 image'}" + (f"\n{prompt}" if prompt else "")
+    else:
+        language = get_language_from_extension(file_filename)
+        user_msg = f"[{file_category.value.title()} Analysis] {file_filename} ({language})" + (f"\n{prompt}" if prompt else "")
+    await save_message(user["id"], conv_id, "user", user_msg)
 
-# Save user message (reference, not full binary)
-if file_category == FileCategory.IMAGE:
- user_msg = f"[Image Analysis] {file_filename if file and file.filename else 'Base64 image'}" + (f"\n{prompt}" if prompt else "")
-else:
- language = get_language_from_extension(file_filename)
- user_msg = f"[{file_category.value.title()} Analysis] {file_filename} ({language})" + (f"\n{prompt}" if prompt else "")
-await save_message(user["id"], conv_id, "user", user_msg)
+    if file_category == FileCategory.IMAGE:
+        if not GROQ_API_KEY:
+            raise HTTPException(500, "Groq API Key required for image analysis (vision model)")
+        messages = _build_image_analysis_messages(image_data_b64, image_mime_type, prompt)
+        use_model = GROQ_VISION_MODEL
+    elif file_category == FileCategory.CODE:
+        language = get_language_from_extension(file_filename)
+        messages = _build_code_analysis_messages(file_text_content, file_filename, language, prompt)
+        use_model = GROQ_CHAT_MODEL
+    else:
+        messages = _build_document_analysis_messages(file_text_content, file_filename, prompt)
+        use_model = GROQ_CHAT_MODEL
 
-# Build messages based on category
-if file_category == FileCategory.IMAGE:
- if not GROQ_API_KEY:
- raise HTTPException(500, "Groq API Key required for image analysis (vision model)")
- messages = _build_image_analysis_messages(image_data_b64, image_mime_type, prompt)
- use_model = GROQ_VISION_MODEL
-elif file_category == FileCategory.CODE:
- language = get_language_from_extension(file_filename)
- messages = _build_code_analysis_messages(file_text_content, file_filename, language, prompt)
- use_model = GROQ_CHAT_MODEL
-else:
- messages = _build_document_analysis_messages(file_text_content, file_filename, prompt)
- use_model = GROQ_CHAT_MODEL
+    if stream:
+        async def analysis_event_gen():
+            task = asyncio.current_task()
+            active_streams[user["id"]] = task
+            try:
+                full_text = ""
+                async for token in stream_groq_chat(messages, model=use_model):
+                    if task.cancelled():
+                        break
+                    full_text += token
+                    yield sse({"type": "token", "text": token})
+                await save_message(user["id"], conv_id, "assistant", full_text)
+                yield sse({"type": "done"})
+            except Exception as e:
+                logger.error(f"Analysis stream error: {e}")
+                yield sse({"type": "error", "message": str(e)})
+            finally:
+                active_streams.pop(user["id"], None)
+        return StreamingResponse(analysis_event_gen(), media_type="text/event-stream")
+    else:
+        try:
+            reply = await groq_chat_sync(messages, model=use_model)
+            await save_message(user["id"], conv_id, "assistant", reply)
+            return {"reply": reply, "conversation_id": conv_id, "analysis_type": file_category.value}
+        except Exception as e:
+            logger.error(f"Analysis error: {e}")
+            raise HTTPException(500, str(e))
 
-# Stream response
-if stream:
- async def analysis_event_gen():
- task = asyncio.current_task()
- active_streams[user["id"]] = task
- try:
- full_text = ""
- async for token in stream_groq_chat(messages, model=use_model):
- if task.cancelled():
- break
- full_text += token
- yield sse({"type": "token", "text": token})
-
- await save_message(user["id"], conv_id, "assistant", full_text)
- yield sse({"type": "done"})
-
- except Exception as e:
- logger.error(f"Analysis stream error: {e}")
- yield sse({"type": "error", "message": str(e)})
- finally:
- active_streams.pop(user["id"], None)
-
- return StreamingResponse(analysis_event_gen(), media_type="text/event-stream")
-
-# Non-stream response
-else:
- try:
- reply = await groq_chat_sync(messages, model=use_model)
- await save_message(user["id"], conv_id, "assistant", reply)
- return {"reply": reply, "conversation_id": conv_id, "analysis_type": file_category.value}
- except Exception as e:
- logger.error(f"Analysis error: {e}")
- raise HTTPException(500, str(e))
+# =========================
+# ANALYSIS ENDPOINT (JSON BODY)
+# =========================
 @app.post("/analysis/json")
 async def analyze_file_json(req: Request, res: Response):
- """
- JSON body version of /analysis for programmatic use.
- Body: { "image_base64": "...", "prompt": "...", "analysis_type": "image|code|document|auto", "content": "...", "filename": "...", "conversation_id": "...", "stream": true }
- """
- body = await req.json()
+    """
+    JSON body version of /analysis for programmatic use.
+    Body: { "image_base64": "...", "prompt": "...", "analysis_type": "image|code|document|auto",
+             "content": "...", "filename": "...", "conversation_id": "...", "stream": true }
+    """
+    body = await req.json()
 
-image_b64 = body.get("image_base64")
-text_content = body.get("content")
-filename = body.get("filename", "unknown")
-prompt = body.get("prompt")
-conv_id_proposed = body.get("conversation_id")
-do_stream = body.get("stream", True)
-remember = body.get("remember", True)
-analysis_type_str = body.get("analysis_type", "auto")
+    image_b64 = body.get("image_base64")
+    text_content = body.get("content")
+    filename = body.get("filename", "unknown")
+    prompt = body.get("prompt")
+    conv_id_proposed = body.get("conversation_id")
+    do_stream = body.get("stream", True)
+    remember = body.get("remember", True)
+    analysis_type_str = body.get("analysis_type", "auto")
 
-user = await get_user(req, res, remember)
+    user = await get_user(req, res, remember)
 
-file_category = FileCategory.UNKNOWN
-image_data_b64 = None
-image_mime_type = body.get("image_mime", "image/png")
-file_text = None
+    file_category = FileCategory.UNKNOWN
+    image_data_b64 = None
+    image_mime_type = body.get("image_mime", "image/png")
+    file_text = None
 
-if image_b64:
- clean_b64 = image_b64
- if "," in image_b64:
- clean_b64 = image_b64.split(",", 1)[1]
- image_data_b64 = clean_b64.strip()
- file_category = FileCategory.IMAGE if analysis_type_str in ("auto", "image") else FileCategory(analysis_type_str)
-elif text_content:
- file_text = text_content[:MAX_TEXT_LENGTH]
- if analysis_type_str and analysis_type_str != "auto":
- try:
- file_category = FileCategory(analysis_type_str)
- except ValueError:
- file_category = get_file_category(filename)
- else:
- file_category = get_file_category(filename)
-else:
- raise HTTPException(400, "Either 'image_base64' or 'content' must be provided.")
+    if image_b64:
+        clean_b64 = image_b64
+        if "," in image_b64:
+            clean_b64 = image_b64.split(",", 1)[1]
+        image_data_b64 = clean_b64.strip()
+        file_category = FileCategory.IMAGE if analysis_type_str in ("auto", "image") else FileCategory(analysis_type_str)
+    elif text_content:
+        file_text = text_content[:MAX_TEXT_LENGTH]
+        if analysis_type_str and analysis_type_str != "auto":
+            try:
+                file_category = FileCategory(analysis_type_str)
+            except ValueError:
+                file_category = get_file_category(filename)
+        else:
+            file_category = get_file_category(filename)
+    else:
+        raise HTTPException(400, "Either 'image_base64' or 'content' must be provided.")
 
-display_prompt = prompt or f"Analysis of {filename}"
-conv_id = await get_or_create_conversation(user_id=user["id"], proposed_id=conv_id_proposed, title=display_prompt)
+    display_prompt = prompt or f"Analysis of {filename}"
+    conv_id = await get_or_create_conversation(user_id=user["id"], proposed_id=conv_id_proposed, title=display_prompt)
 
-# Save user message
-if file_category == FileCategory.IMAGE:
- user_msg = f"[Image Analysis] {filename}" + (f"\n{prompt}" if prompt else "")
-else:
- language = get_language_from_extension(filename)
- user_msg = f"[{file_category.value.title()} Analysis] {filename} ({language})" + (f"\n{prompt}" if prompt else "")
-await save_message(user["id"], conv_id, "user", user_msg)
+    if file_category == FileCategory.IMAGE:
+        user_msg = f"[Image Analysis] {filename}" + (f"\n{prompt}" if prompt else "")
+    else:
+        language = get_language_from_extension(filename)
+        user_msg = f"[{file_category.value.title()} Analysis] {filename} ({language})" + (f"\n{prompt}" if prompt else "")
+    await save_message(user["id"], conv_id, "user", user_msg)
 
-# Build messages
-if file_category == FileCategory.IMAGE:
- if not GROQ_API_KEY:
- raise HTTPException(500, "Groq API Key required for image analysis")
- messages = _build_image_analysis_messages(image_data_b64, image_mime_type, prompt)
- use_model = GROQ_VISION_MODEL
-elif file_category == FileCategory.CODE:
- language = get_language_from_extension(filename)
- messages = _build_code_analysis_messages(file_text, filename, language, prompt)
- use_model = GROQ_CHAT_MODEL
-else:
- messages = _build_document_analysis_messages(file_text, filename, prompt)
- use_model = GROQ_CHAT_MODEL
+    if file_category == FileCategory.IMAGE:
+        if not GROQ_API_KEY:
+            raise HTTPException(500, "Groq API Key required for image analysis")
+        messages = _build_image_analysis_messages(image_data_b64, image_mime_type, prompt)
+        use_model = GROQ_VISION_MODEL
+    elif file_category == FileCategory.CODE:
+        language = get_language_from_extension(filename)
+        messages = _build_code_analysis_messages(file_text, filename, language, prompt)
+        use_model = GROQ_CHAT_MODEL
+    else:
+        messages = _build_document_analysis_messages(file_text, filename, prompt)
+        use_model = GROQ_CHAT_MODEL
 
-if do_stream:
- async def analysis_json_event_gen():
- task = asyncio.current_task()
- active_streams[user["id"]] = task
- try:
- full_text = ""
- async for token in stream_groq_chat(messages, model=use_model):
- if task.cancelled():
- break
- full_text += token
- yield sse({"type": "token", "text": token})
- await save_message(user["id"], conv_id, "assistant", full_text)
- yield sse({"type": "done"})
- except Exception as e:
- logger.error(f"Analysis JSON stream error: {e}")
- yield sse({"type": "error", "message": str(e)})
- finally:
- active_streams.pop(user["id"], None)
+    if do_stream:
+        async def analysis_json_event_gen():
+            task = asyncio.current_task()
+            active_streams[user["id"]] = task
+            try:
+                full_text = ""
+                async for token in stream_groq_chat(messages, model=use_model):
+                    if task.cancelled():
+                        break
+                    full_text += token
+                    yield sse({"type": "token", "text": token})
+                await save_message(user["id"], conv_id, "assistant", full_text)
+                yield sse({"type": "done"})
+            except Exception as e:
+                logger.error(f"Analysis JSON stream error: {e}")
+                yield sse({"type": "error", "message": str(e)})
+            finally:
+                active_streams.pop(user["id"], None)
+        return StreamingResponse(analysis_json_event_gen(), media_type="text/event-stream")
+    else:
+        try:
+            reply = await groq_chat_sync(messages, model=use_model)
+            await save_message(user["id"], conv_id, "assistant", reply)
+            return {"reply": reply, "conversation_id": conv_id, "analysis_type": file_category.value}
+        except Exception as e:
+            logger.error(f"Analysis JSON error: {e}")
+            raise HTTPException(500, str(e))
 
- return StreamingResponse(analysis_json_event_gen(), media_type="text/event-stream")
-else:
- try:
- reply = await groq_chat_sync(messages, model=use_model)
- await save_message(user["id"], conv_id, "assistant", reply)
- return {"reply": reply, "conversation_id": conv_id, "analysis_type": file_category.value}
- except Exception as e:
- logger.error(f"Analysis JSON error: {e}")
- raise HTTPException(500, str(e))
-
-
+# =========================
+# UNIVERSAL CHAT ENDPOINT
+# =========================
 @app.post("/ask/universal")
 async def ask_universal(req: Request, res: Response):
- content_type = req.headers.get("content-type", "")
- body = {}
+    content_type = req.headers.get("content-type", "")
+    body = {}
 
-if "application/json" in content_type:
- body = await req.json()
-elif "multipart/form-data" in content_type:
- form = await req.form()
- body = dict(form)
- if "file" in form:
- file: UploadFile = form["file"]
- content_bytes = b""
- while chunk := await file.read(1024 * 1024):
- content_bytes += chunk
- if len(content_bytes) > MAX_FILE_SIZE:
- raise HTTPException(413, "File too large")
+    if "application/json" in content_type:
+        body = await req.json()
+    elif "multipart/form-data" in content_type:
+        form = await req.form()
+        body = dict(form)
+        if "file" in form:
+            file: UploadFile = form["file"]
+            content_bytes = b""
+            while chunk := await file.read(1024 * 1024):
+                content_bytes += chunk
+                if len(content_bytes) > MAX_FILE_SIZE:
+                    raise HTTPException(413, "File too large")
+            text_content = await extract_text_safe(content_bytes)
+            file_prefix = f"\n\n[FILE CONTENT: {file.filename}]\n{text_content}\n[END FILE]\n"
+            body["prompt"] = body.get("prompt", "") + file_prefix
 
- text_content = await extract_text_safe(content_bytes)
- file_prefix = f"\n\n[FILE CONTENT: {file.filename}]\n{text_content}\n[END FILE]\n"
- body["prompt"] = body.get("prompt", "") + file_prefix
+    prompt = body.get("prompt", "")
+    conv_id = body.get("conversation_id")
+    stream = body.get("stream", True)
+    remember = body.get("remember", True)
+    image_size = body.get("image_size", "1024x1024")
+    image_quality = body.get("image_quality", "medium")
 
-prompt = body.get("prompt", "")
-conv_id = body.get("conversation_id")
-stream = body.get("stream", True)
-remember = body.get("remember", True)
-image_size = body.get("image_size", "1024x1024")
-image_quality = body.get("image_quality", "medium")
+    if not prompt:
+        raise HTTPException(400, "Prompt required")
 
-if not prompt:
- raise HTTPException(400, "Prompt required")
+    user = await get_user(req, res, remember)
+    intent = _detector.detect(prompt)
 
-user = await get_user(req, res, remember)
-intent = _detector.detect(prompt)
+    is_image_request = intent.intent == IntentCategory.IMAGE_GENERATION
 
-is_image_request = intent.intent == IntentCategory.IMAGE_GENERATION
+    needs_search = intent.intent == IntentCategory.RESEARCH
+    search_keywords = ["latest", "news", "current", "price", "weather", "stock", "who is"]
+    if any(kw in prompt.lower() for kw in search_keywords):
+        needs_search = True
 
-needs_search = intent.intent == IntentCategory.RESEARCH
-search_keywords = ["latest", "news", "current", "price", "weather", "stock", "who is"]
-if any(kw in prompt.lower() for kw in search_keywords):
- needs_search = True
+    conv_id = await get_or_create_conversation(user_id=user["id"], proposed_id=conv_id, title=prompt)
+    await save_message(user["id"], conv_id, "user", prompt)
 
-conv_id = await get_or_create_conversation(user_id=user["id"], proposed_id=conv_id, title=prompt)
-await save_message(user["id"], conv_id, "user", prompt)
+    # IMAGE GENERATION PATH
+    if is_image_request:
+        if stream:
+            async def image_event_gen():
+                task = asyncio.current_task()
+                active_streams[user["id"]] = task
+                try:
+                    yield sse({"type": "token", "text": "*Generating image...*\n\n"})
+                    image_b64 = await generate_image_openai_sync(
+                        prompt=prompt, size=image_size, quality=image_quality
+                    )
+                    md_image = f"![Generated Image](data:image/png;base64,{image_b64})"
+                    await save_message(user["id"], conv_id, "assistant", md_image)
+                    yield sse({"type": "token", "text": md_image})
+                    yield sse({"type": "done"})
+                except Exception as e:
+                    logger.error(f"Image stream error: {e}")
+                    yield sse({"type": "error", "message": str(e)})
+                finally:
+                    active_streams.pop(user["id"], None)
+            return StreamingResponse(image_event_gen(), media_type="text/event-stream")
+        else:
+            try:
+                image_b64 = await generate_image_openai_sync(
+                    prompt=prompt, size=image_size, quality=image_quality
+                )
+                md_image = f"![Generated Image](data:image/png;base64,{image_b64})"
+                await save_message(user["id"], conv_id, "assistant", md_image)
+                return {"reply": md_image, "conversation_id": conv_id}
+            except Exception as e:
+                logger.error(f"Image generation error: {e}")
+                raise HTTPException(500, str(e))
 
+    # TEXT/CHAT PATH
+    if stream:
+        async def event_gen():
+            task = asyncio.current_task()
+            active_streams[user["id"]] = task
+            try:
+                full_text = ""
+                search_context = ""
 
-if is_image_request:
- if stream:
- async def image_event_gen():
- task = asyncio.current_task()
- active_streams[user["id"]] = task
- try:
- yield sse({"type": "token", "text": "*Generating image...*\n\n"})
+                if needs_search:
+                    yield sse({"type": "token", "text": "*Searching web...*\n\n"})
+                    search_context = await perform_web_search(prompt)
 
- image_b64 = await generate_image_openai_sync(
- prompt=prompt,
- size=image_size,
- quality=image_quality
- )
+                history = await get_history(conv_id)
+                system_prompt = get_system_prompt(prompt)
+                if search_context:
+                    system_prompt += f"\n\nWEB SEARCH RESULTS:\n{search_context}\n\nUse these results to answer."
 
- md_image = f"![Generated Image](data:image/png;base64,{image_b64})"
+                messages = [{"role": "system", "content": system_prompt}] + history
 
- await save_message(user["id"], conv_id, "assistant", md_image)
+                async for token in stream_groq_chat(messages):
+                    if task.cancelled():
+                        break
+                    full_text += token
+                    yield sse({"type": "token", "text": token})
 
- yield sse({"type": "token", "text": md_image})
- yield sse({"type": "done"})
+                await save_message(user["id"], conv_id, "assistant", full_text)
+                yield sse({"type": "done"})
+            except Exception as e:
+                logger.error(f"Stream error: {e}")
+                yield sse({"type": "error", "message": str(e)})
+            finally:
+                active_streams.pop(user["id"], None)
+        return StreamingResponse(event_gen(), media_type="text/event-stream")
+    else:
+        search_context = ""
+        if needs_search:
+            search_context = await perform_web_search(prompt)
 
- except Exception as e:
- logger.error(f"Image stream error: {e}")
- yield sse({"type": "error", "message": str(e)})
- finally:
- active_streams.pop(user["id"], None)
+        history = await get_history(conv_id)
+        system_prompt = get_system_prompt(prompt)
+        if search_context:
+            system_prompt += f"\n\nWEB SEARCH RESULTS:\n{search_context}"
 
- return StreamingResponse(image_event_gen(), media_type="text/event-stream")
- else:
- try:
- image_b64 = await generate_image_openai_sync(
- prompt=prompt, size=image_size, quality=image_quality
- )
- md_image = f"![Generated Image](data:image/png;base64,{image_b64})"
- await save_message(user["id"], conv_id, "assistant", md_image)
+        messages = [{"role": "system", "content": system_prompt}] + history
 
- return {"reply": md_image, "conversation_id": conv_id}
- except Exception as e:
- logger.error(f"Image generation error: {e}")
- raise HTTPException(500, str(e))
+        try:
+            reply = await groq_chat_sync(messages)
+            await save_message(user["id"], conv_id, "assistant", reply)
+            return {"reply": reply, "conversation_id": conv_id}
+        except Exception as e:
+            logger.error(f"Non-stream chat error: {e}")
+            raise HTTPException(429, "Rate limit exceeded. Please wait a minute before trying again.")
 
-
-if stream:
- async def event_gen():
- task = asyncio.current_task()
- active_streams[user["id"]] = task
- try:
- full_text = ""
- search_context = ""
-
- if needs_search:
- yield sse({"type": "token", "text": "*Searching web...*\n\n"})
- search_context = await perform_web_search(prompt)
-
- history = await get_history(conv_id)
- system_prompt = get_system_prompt(prompt)
- if search_context:
- system_prompt += f"\n\nWEB SEARCH RESULTS:\n{search_context}\n\nUse these results to answer."
-
- messages = [{"role": "system", "content": system_prompt}] + history
-
- async for token in stream_groq_chat(messages):
- if task.cancelled():
- break
- full_text += token
- yield sse({"type": "token", "text": token})
-
- await save_message(user["id"], conv_id, "assistant", full_text)
- yield sse({"type": "done"})
-
- except Exception as e:
- logger.error(f"Stream error: {e}")
- yield sse({"type": "error", "message": str(e)})
- finally:
- active_streams.pop(user["id"], None)
-
- return StreamingResponse(event_gen(), media_type="text/event-stream")
-
-else:
- search_context = ""
- if needs_search:
- search_context = await perform_web_search(prompt)
-
- history = await get_history(conv_id)
- system_prompt = get_system_prompt(prompt)
- if search_context:
- system_prompt += f"\n\nWEB SEARCH RESULTS:\n{search_context}"
-
- messages = [{"role": "system", "content": system_prompt}] + history
-
- try:
- reply = await groq_chat_sync(messages)
- await save_message(user["id"], conv_id, "assistant", reply)
- return {"reply": reply, "conversation_id": conv_id}
- except Exception as e:
- logger.error(f"Non-stream chat error: {e}")
- raise HTTPException(429, "Rate limit exceeded. Please wait a minute before trying again.")
-
-
+# =========================
+# CHAT MANAGEMENT
+# =========================
 @app.post("/newchat")
 async def new_chat(req: Request, res: Response):
- user = await get_user(req, res)
- new_id = str(uuid.uuid4())
- now = datetime.now(timezone.utc).isoformat()
- await _execute_supabase_with_retry(
- supabase.table("conversations").insert({
- "id": new_id, "user_id": user["id"], "title": "New Chat",
- "created_at": now, "updated_at": now,
- })
- )
- return {"conversation_id": new_id, "status": "created"}
+    user = await get_user(req, res)
+    new_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    await _execute_supabase_with_retry(
+        supabase.table("conversations").insert({
+            "id": new_id, "user_id": user["id"], "title": "New Chat",
+            "created_at": now, "updated_at": now,
+        })
+    )
+    return {"conversation_id": new_id, "status": "created"}
 
 @app.delete("/chats/{chat_id}")
 async def delete_chat(chat_id: str, req: Request, res: Response):
- """
- Delete a conversation and all its messages.
- Verifies ownership before deletion.
- """
- user = await get_user(req, res)
+    """Delete a conversation and all its messages. Verifies ownership."""
+    user = await get_user(req, res)
 
-# Verify the chat belongs to this user
-check = await _execute_supabase_with_retry(
- supabase.table("conversations")
- .select("id, user_id")
- .eq("id", chat_id)
- .eq("user_id", user["id"])
- .limit(1)
-)
+    check = await _execute_supabase_with_retry(
+        supabase.table("conversations")
+        .select("id, user_id")
+        .eq("id", chat_id)
+        .eq("user_id", user["id"])
+        .limit(1)
+    )
 
-if not check.data:
- logger.warning(f"DELETE /chats/{chat_id}: Chat not found or not owned by user {user['id']}")
- raise HTTPException(404, "Chat not found")
+    if not check.data:
+        logger.warning(f"DELETE /chats/{chat_id}: Chat not found or not owned by user {user['id']}")
+        raise HTTPException(404, "Chat not found")
 
-# Delete all messages in the conversation first
-try:
- await _execute_supabase_with_retry(
- supabase.table("messages")
- .delete()
- .eq("conversation_id", chat_id)
- )
-except Exception as e:
- logger.error(f"Failed to delete messages for chat {chat_id}: {e}")
- # Continue to try deleting the conversation itself
+    try:
+        await _execute_supabase_with_retry(
+            supabase.table("messages")
+            .delete()
+            .eq("conversation_id", chat_id)
+        )
+    except Exception as e:
+        logger.error(f"Failed to delete messages for chat {chat_id}: {e}")
 
-# Delete the conversation
-try:
- await _execute_supabase_with_retry(
- supabase.table("conversations")
- .delete()
- .eq("id", chat_id)
- .eq("user_id", user["id"])
- )
-except Exception as e:
- logger.error(f"Failed to delete chat {chat_id}: {e}")
- raise HTTPException(500, "Failed to delete chat")
+    try:
+        await _execute_supabase_with_retry(
+            supabase.table("conversations")
+            .delete()
+            .eq("id", chat_id)
+            .eq("user_id", user["id"])
+        )
+    except Exception as e:
+        logger.error(f"Failed to delete chat {chat_id}: {e}")
+        raise HTTPException(500, "Failed to delete chat")
 
-logger.info(f"Deleted chat {chat_id} and its messages for user {user['id']}")
-return {"status": "deleted", "conversation_id": chat_id}
+    logger.info(f"Deleted chat {chat_id} and its messages for user {user['id']}")
+    return {"status": "deleted", "conversation_id": chat_id}
+
 @app.get("/chats")
 async def list_chats(req: Request, res: Response, limit: int = Query(50, le=100), offset: int = Query(0, ge=0)):
- user = await get_user(req, res)
- result = await _execute_supabase_with_retry(
- supabase.table("conversations")
- .select("*")
- .eq("user_id", user["id"])
- .order("updated_at", desc=True)
- .range(offset, offset + limit - 1)
- )
- return {"chats": result.data}
+    user = await get_user(req, res)
+    result = await _execute_supabase_with_retry(
+        supabase.table("conversations")
+        .select("*")
+        .eq("user_id", user["id"])
+        .order("updated_at", desc=True)
+        .range(offset, offset + limit - 1)
+    )
+    return {"chats": result.data}
 
 @app.get("/chat/{conversation_id}/messages")
 async def get_messages(conversation_id: str):
- msgs = await _execute_supabase_with_retry(
- supabase.table("messages")
- .select("role, content, created_at")
- .eq("conversation_id", conversation_id)
- .order("created_at", desc=False)
- )
- return {"messages": msgs.data}
+    msgs = await _execute_supabase_with_retry(
+        supabase.table("messages")
+        .select("role, content, created_at")
+        .eq("conversation_id", conversation_id)
+        .order("created_at", desc=False)
+    )
+    return {"messages": msgs.data}
 
-
+# =========================
+# TTS / STT
+# =========================
 @app.post("/tts")
 async def text_to_speech(req: Request):
- data = await req.json()
- text = data.get("text")
- voice = data.get("voice", "alloy")
+    data = await req.json()
+    text = data.get("text")
+    voice = data.get("voice", "alloy")
 
-allowed_voices = ["alloy", "onyx", "nova", "shimmer", "echo", "fable"]
-if voice not in allowed_voices:
- voice = "alloy"
+    allowed_voices = ["alloy", "onyx", "nova", "shimmer", "echo", "fable"]
+    if voice not in allowed_voices:
+        voice = "alloy"
 
-if not text:
- raise HTTPException(400, "text required")
-if not OPENAI_API_KEY:
- raise HTTPException(500, "Missing OpenAI API Key")
+    if not text:
+        raise HTTPException(400, "text required")
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "Missing OpenAI API Key")
 
-async def stream_audio():
- async with httpx.AsyncClient(timeout=60) as client:
- async with client.stream(
- "POST",
- "https://api.openai.com/v1/audio/speech",
- headers=get_openai_headers(),
- json={
- "model": OPENAI_TTS_MODEL,
- "voice": voice,
- "input": text,
- "response_format": "mp3"
- }
- ) as response:
- if response.status_code != 200:
- error_body = await response.aread()
- logger.error(f"OpenAI TTS Error {response.status_code}: {error_body.decode()}")
- return
- async for chunk in response.aiter_bytes():
- yield chunk
+    async def stream_audio():
+        async with httpx.AsyncClient(timeout=60) as client:
+            async with client.stream(
+                "POST",
+                "https://api.openai.com/v1/audio/speech",
+                headers=get_openai_headers(),
+                json={
+                    "model": OPENAI_TTS_MODEL,
+                    "voice": voice,
+                    "input": text,
+                    "response_format": "mp3"
+                }
+            ) as response:
+                if response.status_code != 200:
+                    error_body = await response.aread()
+                    logger.error(f"OpenAI TTS Error {response.status_code}: {error_body.decode()}")
+                    return
+                async for chunk in response.aiter_bytes():
+                    yield chunk
 
-return StreamingResponse(stream_audio(), media_type="audio/mpeg")
+    return StreamingResponse(stream_audio(), media_type="audio/mpeg")
+
 @app.get("/tts/voices")
 async def get_voices():
- return {
- "voices": [
- {"id": "alloy", "name": "Alloy"},
- {"id": "fable", "name": "Fable"},
- {"id": "onyx", "name": "Onyx"},
- {"id": "nova", "name": "Nova"},
- {"id": "shimmer", "name": "Shimmer"},
- {"id": "echo", "name": "Echo"}
- ]
- }
+    return {
+        "voices": [
+            {"id": "alloy", "name": "Alloy"},
+            {"id": "fable", "name": "Fable"},
+            {"id": "onyx", "name": "Onyx"},
+            {"id": "nova", "name": "Nova"},
+            {"id": "shimmer", "name": "Shimmer"},
+            {"id": "echo", "name": "Echo"}
+        ]
+    }
 
 @app.post("/stt")
 async def speech_to_text(file: UploadFile = File(...)):
- if not GROQ_API_KEY:
- raise HTTPException(500, "Missing Groq API Key")
+    if not GROQ_API_KEY:
+        raise HTTPException(500, "Missing Groq API Key")
 
-allowed_types = ["audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav", "audio/webm", "audio/ogg", "audio/flac", "audio/m4a", "video/mp4", "video/webm"]
-if file.content_type and file.content_type not in allowed_types:
- logger.warning(f"STT: Unexpected content type: {file.content_type}")
+    allowed_types = ["audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav", "audio/webm", "audio/ogg", "audio/flac", "audio/m4a", "video/mp4", "video/webm"]
+    if file.content_type and file.content_type not in allowed_types:
+        logger.warning(f"STT: Unexpected content type: {file.content_type}")
 
-content = b""
-while chunk := await file.read(1024 * 1024):
- content += chunk
- if len(content) > 25 * 1024 * 1024:
- raise HTTPException(400, "Audio file too large. Maximum size is 25MB.")
+    content = b""
+    while chunk := await file.read(1024 * 1024):
+        content += chunk
+        if len(content) > 25 * 1024 * 1024:
+            raise HTTPException(400, "Audio file too large. Maximum size is 25MB.")
 
-if len(content) == 0:
- raise HTTPException(400, "Empty audio file")
+    if len(content) == 0:
+        raise HTTPException(400, "Empty audio file")
 
-try:
- async with httpx.AsyncClient(timeout=60) as client:
- files = {"file": (file.filename or "audio.mp3", content, file.content_type or "audio/mpeg")}
- data = {"model": GROQ_STT_MODEL, "response_format": "json"}
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            files = {"file": (file.filename or "audio.mp3", content, file.content_type or "audio/mpeg")}
+            data = {"model": GROQ_STT_MODEL, "response_format": "json"}
 
- r = await client.post(
- "https://api.groq.com/openai/v1/audio/transcriptions",
- headers=get_groq_headers_multipart(), files=files, data=data
- )
- if r.status_code != 200:
- error_detail = r.text
- logger.error(f"Groq STT Error {r.status_code}: {error_detail}")
- raise HTTPException(status_code=r.status_code, detail=f"Groq STT failed: {error_detail}")
+            r = await client.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers=get_groq_headers_multipart(), files=files, data=data
+            )
+            if r.status_code != 200:
+                error_detail = r.text
+                logger.error(f"Groq STT Error {r.status_code}: {error_detail}")
+                raise HTTPException(status_code=r.status_code, detail=f"Groq STT failed: {error_detail}")
 
- result = r.json()
- return {"text": result.get("text", ""), "model": GROQ_STT_MODEL, "provider": "groq"}
+            result = r.json()
+            return {"text": result.get("text", ""), "model": GROQ_STT_MODEL, "provider": "groq"}
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Speech transcription timed out")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"STT Error: {e}")
+        raise HTTPException(500, f"Speech to text failed: {str(e)}")
 
-except httpx.TimeoutException:
- raise HTTPException(504, "Speech transcription timed out")
-except HTTPException:
- raise
-except Exception as e:
- logger.error(f"STT Error: {e}")
- raise HTTPException(500, f"Speech to text failed: {str(e)}")
-
-
+# =========================
+# SESSION
+# =========================
 @app.post("/session/logout")
 async def logout(req: Request, res: Response):
- clear_session_cookies(res)
- return {"status": "logged_out"}
+    clear_session_cookies(res)
+    return {"status": "logged_out"}
 
-=========================
+# =========================
+# MAIN
+# =========================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)
+```
 
-MAIN
+**What happened:** When you copied the previous code into your editor/deployment, all indentation was stripped — every line became column 0. Python is indentation-sensitive, so it couldn't parse any `if`, `def`, `class`, `async def`, `while`, `for`, `try`, `with` block. The error pointed at line 862 because that's where the parser first hit an `if` with no indented body below it.
 
-=========================
-
-if name == "main":
- import uvicorn
- uvicorn.run(app, host="0.0.0.0", port=8080)
+**What to watch for when copying:** If you're pasting into a deployment panel (like Render), make sure the paste preserves leading spaces/tabs. If your editor or terminal strips indentation, use `curl` or a direct file upload instead of copy-paste. You can also verify locally with `python -c "import py_compile; py_compile.compile('app.py', doraise=True)"` before deploying.
