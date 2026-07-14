@@ -787,11 +787,6 @@ return [
  {"role": "system", "content": DOCUMENT_ANALYSIS_SYSTEM_PROMPT},
  {"role": "user", "content": user_content}
 ]
-=========================
-
-ENDPOINTS
-
-=========================
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
