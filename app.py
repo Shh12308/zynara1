@@ -818,11 +818,7 @@ async def root():
  }
  }
 
-=========================
 
-ANALYSIS ENDPOINT
-
-=========================
 
 @app.post("/analysis")
 async def analyze_file(
@@ -1059,11 +1055,7 @@ else:
  except Exception as e:
  logger.error(f"Analysis JSON error: {e}")
  raise HTTPException(500, str(e))
-=========================
 
-UNIVERSAL CHAT ENDPOINT
-
-=========================
 
 @app.post("/ask/universal")
 async def ask_universal(req: Request, res: Response):
@@ -1110,9 +1102,7 @@ if any(kw in prompt.lower() for kw in search_keywords):
 conv_id = await get_or_create_conversation(user_id=user["id"], proposed_id=conv_id, title=prompt)
 await save_message(user["id"], conv_id, "user", prompt)
 
-# ==========================================
-# IMAGE GENERATION PATH (STREAMS AS MARKDOWN)
-# ==========================================
+
 if is_image_request:
  if stream:
  async def image_event_gen():
@@ -1154,9 +1144,7 @@ if is_image_request:
  logger.error(f"Image generation error: {e}")
  raise HTTPException(500, str(e))
 
-# ===================
-# TEXT/CHAT PATH
-# ===================
+
 if stream:
  async def event_gen():
  task = asyncio.current_task()
@@ -1212,11 +1200,7 @@ else:
  except Exception as e:
  logger.error(f"Non-stream chat error: {e}")
  raise HTTPException(429, "Rate limit exceeded. Please wait a minute before trying again.")
-=========================
 
-CHAT MANAGEMENT ENDPOINTS
-
-=========================
 
 @app.post("/newchat")
 async def new_chat(req: Request, res: Response):
@@ -1299,11 +1283,6 @@ async def get_messages(conversation_id: str):
  )
  return {"messages": msgs.data}
 
-=========================
-
-TTS / STT ENDPOINTS
-
-=========================
 
 @app.post("/tts")
 async def text_to_speech(req: Request):
@@ -1396,11 +1375,7 @@ except HTTPException:
 except Exception as e:
  logger.error(f"STT Error: {e}")
  raise HTTPException(500, f"Speech to text failed: {str(e)}")
-=========================
 
-SESSION ENDPOINTS
-
-=========================
 
 @app.post("/session/logout")
 async def logout(req: Request, res: Response):
