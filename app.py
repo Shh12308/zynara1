@@ -614,7 +614,7 @@ async def save_message(user_id: str, conv_id: str, role: str, content: str):
     await _execute_supabase_with_retry(supabase.table("messages").insert(data))
 
 
-async def get_history(conv_id: str, limit: int = 20):
+async def get_history(conv_id: str, limit: int = 4):
     res = await _execute_supabase_with_retry(
         supabase.table("messages")
         .select("role, content")
