@@ -125,6 +125,11 @@ _session_cache_ttl = 300
 _rate_limit_store: Dict[str, List[float]] = {}
 _conv_creation_locks: Dict[str, asyncio.Lock] = {}
 
+# FIX #1: Global lock to prevent duplicate user/session creation
+_new_user_lock = asyncio.Lock()
+_pending_new_user_id: Optional[str] = None
+_new_user_created_event = asyncio.Event()
+
 
 def _get_conv_lock(conv_id: str) -> asyncio.Lock:
     if conv_id not in _conv_creation_locks:
@@ -240,7 +245,7 @@ def _is_image_mime(mime: str) -> bool:
 
 
 # =========================
-# AUTH SYSTEM
+# AUTH SYSTEM (FIXED)
 # =========================
 PRIMARY_COOKIE = "HeloxAI_Session"
 SESSION_TOKEN_COOKIE = "HeloxAI_Token"
@@ -293,7 +298,9 @@ def is_session_expired(expiry_str: str) -> bool:
 async def validate_session_token(user_id: str, token: str) -> bool:
     try:
         if user_id in _session_cache and _session_cache[user_id].get("token") == token:
-            return True
+            cache_time = _session_cache[user_id].get("time", 0)
+            if time.time() - cache_time < _session_cache_ttl:
+                return True
 
         result = await asyncio.to_thread(
             supabase.table("user_sessions")
@@ -306,7 +313,7 @@ async def validate_session_token(user_id: str, token: str) -> bool:
         )
 
         if result.data and result.data[0]["token"] == token:
-            _session_cache[user_id] = {"token": token}
+            _session_cache[user_id] = {"token": token, "time": time.time()}
             return True
         return False
     except Exception as e:
@@ -349,7 +356,7 @@ async def create_user_session(user_id: str, remember: bool = True) -> Optional[s
                 "created_at": datetime.now(timezone.utc).isoformat()
             }).execute
         )
-        _session_cache[user_id] = {"token": token}
+        _session_cache[user_id] = {"token": token, "time": time.time()}
         return token
     except Exception as e:
         logger.error(f"Failed to create session: {e}")
@@ -567,30 +574,100 @@ async def _execute_supabase_with_retry(query_builder):
 
 
 async def get_user(req: Request, res: Response, remember: bool = True) -> Dict[str, Any]:
+    """
+    Get or create a user session from cookies.
+    Uses a global lock to prevent duplicate user/session creation
+    when multiple requests arrive simultaneously from the same client.
+    """
+    global _pending_new_user_id, _new_user_created_event
+
     user_id = req.cookies.get(PRIMARY_COOKIE)
     token = req.cookies.get(SESSION_TOKEN_COOKIE)
     expiry = req.cookies.get(SESSION_EXPIRY_COOKIE)
 
+    # --- Fast path: valid existing session ---
     if user_id and token:
         if is_session_expired(expiry or "0"):
             clear_session_cookies(res)
         elif await validate_session_token(user_id, token):
             return {"id": user_id, "session_valid": True}
 
-    new_id = str(uuid.uuid4())
-    new_token = await create_user_session(new_id, remember)
-    if new_token is None:
-        raise HTTPException(500, "Failed to create user session")
+    # --- Slow path: create new user/session ---
+    async with _new_user_lock:
+        if _pending_new_user_id is not None:
+            # Another request is already creating a user — wait for it
+            logger.debug("Waiting for concurrent user creation to complete...")
+            await _new_user_created_event.wait()
+            _new_user_created_event.clear()
 
-    set_session_cookies(res, new_id, new_token, remember)
-    return {"id": new_id, "session_valid": True}
+            # After wait, re-check: if cookies were set by the winning request
+            # they won't appear on THIS request object, but we can check the DB
+            # via the pending user id
+            if _pending_new_user_id != "__failed__":
+                candidate_id = _pending_new_user_id
+                # Validate the session that was just created
+                result = await asyncio.to_thread(
+                    supabase.table("user_sessions")
+                    .select("token")
+                    .eq("user_id", candidate_id)
+                    .eq("is_valid", True)
+                    .order("created_at", desc=True)
+                    .limit(1)
+                    .execute
+                )
+                if result.data:
+                    winning_token = result.data[0]["token"]
+                    set_session_cookies(res, candidate_id, winning_token, remember)
+                    _session_cache[candidate_id] = {"token": winning_token, "time": time.time()}
+                    _pending_new_user_id = None
+                    return {"id": candidate_id, "session_valid": True}
+            # Creation failed or invalid — fall through to create our own
+            _pending_new_user_id = None
+
+        # Mark that we are creating a user
+        _pending_new_user_id = "creating"
+        _new_user_created_event.clear()
+
+    # --- Actually create the user (outside the lock to not block reads) ---
+    try:
+        new_id = str(uuid.uuid4())
+        new_token = await create_user_session(new_id, remember)
+        if new_token is None:
+            _pending_new_user_id = "__failed__"
+            _new_user_created_event.set()
+            raise HTTPException(500, "Failed to create user session")
+
+        set_session_cookies(res, new_id, new_token, remember)
+
+        # Signal waiting requests with the new user id
+        _pending_new_user_id = new_id
+        _new_user_created_event.set()
+
+        return {"id": new_id, "session_valid": True}
+    except HTTPException:
+        _pending_new_user_id = "__failed__"
+        _new_user_created_event.set()
+        raise
+    except Exception as e:
+        _pending_new_user_id = "__failed__"
+        _new_user_created_event.set()
+        logger.error(f"Unexpected error in get_user: {e}")
+        raise HTTPException(500, "Failed to create user session")
 
 
 async def get_user_with_auth(req: Request, res: Response, remember: bool = True) -> Dict[str, Any]:
-    """Extended get_user that also checks Authorization header."""
+    """
+    Extended get_user that also checks Authorization header.
+    FIX #2: Skip anon key to avoid unnecessary 403s.
+    """
     auth_header = req.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header.replace("Bearer ", "")
+
+        # Skip anon key — it will always 403 and we'll fall back anyway
+        if SUPABASE_ANON_KEY and token == SUPABASE_ANON_KEY:
+            return await get_user(req, res, remember)
+
         try:
             user = await asyncio.to_thread(supabase.auth.get_user, token)
             if user and user.user:
@@ -1351,7 +1428,7 @@ async def analyze_file_json(req: Request, res: Response):
 
 
 # =========================
-# UNIVERSAL CHAT ENDPOINT
+# UNIVERSAL CHAT ENDPOINT (COMPLETE)
 # =========================
 @app.post("/ask/universal")
 async def ask_universal(req: Request, res: Response):
@@ -1362,176 +1439,143 @@ async def ask_universal(req: Request, res: Response):
         body = await req.json()
     elif "multipart/form-data" in content_type:
         form = await req.form()
-        body = dict(form)
-        if "file" in form:
-            file: UploadFile = form["file"]
-            content_bytes = b""
-            while chunk := await file.read(1024 * 1024):
-                content_bytes += chunk
-                if len(content_bytes) > MAX_FILE_SIZE:
-                    raise HTTPException(413, "File too large")
-            text_content = await extract_text_safe(content_bytes)
-            file_prefix = (
-                f"\n\n[FILE CONTENT: {file.filename}]\n"
-                f"{text_content}\n[END FILE]\n"
-            )
-            body["prompt"] = body.get("prompt", "") + file_prefix
+        body = {}
+        for key in form:
+            val = form[key]
+            if isinstance(val, UploadFile):
+                content_bytes = b""
+                while chunk := await val.read(1024 * 1024):
+                    content_bytes += chunk
+                    if len(content_bytes) > MAX_FILE_SIZE:
+                        raise HTTPException(413, "File too large")
+                text_content = await extract_text_safe(content_bytes)
+                body["prompt"] = body.get("prompt", "") + (
+                    f"\n\n[FILE CONTENT: {val.filename}]\n"
+                    f"{text_content}\n[END FILE]\n"
+                )
+            else:
+                body[key] = val
 
     prompt = body.get("prompt", "")
-    conv_id = body.get("conversation_id")
-    stream = body.get("stream", True)
+    if not prompt.strip():
+        raise HTTPException(400, "Prompt is required.")
+
+    conversation_id = body.get("conversation_id")
+    do_stream = body.get("stream", True)
     remember = body.get("remember", True)
     image_size = body.get("image_size", "1024x1024")
     image_quality = body.get("image_quality", "medium")
-    mode = body.get("mode", "general")
-    requested_model = body.get("model", "helox")
+    model_key = body.get("model", "helox").lower()
 
-    if not prompt:
-        raise HTTPException(400, "Prompt required")
-
-    # Auth
     user = await get_user_with_auth(req, res, remember)
 
-    # Model routing
-    model_config = MODEL_ROUTING.get(requested_model, MODEL_ROUTING["helox"])
+    # --- Intent Detection ---
+    intent_result = _detector.detect(prompt)
 
-    # Intent detection
-    intent = _detector.detect(prompt)
-    is_image_request = intent.intent == IntentCategory.IMAGE_GENERATION
+    # --- Image Generation ---
+    if intent_result.intent == IntentCategory.IMAGE_GENERATION:
+        conv_id = await get_or_create_conversation(
+            user_id=user["id"],
+            proposed_id=conversation_id,
+            title=prompt[:50]
+        )
+        await save_message(user["id"], conv_id, "user", prompt)
 
-    # Mode-aware behavior
-    needs_search = False
-    force_code_prompt = False
-    force_finance_prompt = False
+        try:
+            image_b64 = await generate_image_openai_sync(
+                prompt, size=image_size, quality=image_quality
+            )
+            img_html = (
+                f'<img src="data:image/png;base64,{image_b64}" '
+                f'alt="Generated image" class="generated-image">'
+            )
+            await save_message(user["id"], conv_id, "assistant", img_html)
 
-    if mode == "search":
-        needs_search = True
-    elif mode == "code":
-        force_code_prompt = True
-    elif mode == "finance":
-        needs_search = True
-        force_finance_prompt = True
-    elif mode == "general":
-        search_keywords = [
-            "latest", "news", "current", "price", "weather",
-            "stock", "who is", "how much", "market", "score"
-        ]
-        if any(kw in prompt.lower() for kw in search_keywords):
-            needs_search = True
+            if do_stream:
+                async def img_stream():
+                    yield sse({"type": "conversation_id", "conversation_id": conv_id})
+                    yield sse({"type": "image", "image": image_b64})
+                    yield sse({"type": "done"})
+                return StreamingResponse(img_stream(), media_type="text/event-stream")
+            else:
+                return {
+                    "reply": img_html,
+                    "conversation_id": conv_id,
+                    "type": "image"
+                }
+        except Exception as e:
+            logger.error(f"Image generation failed: {e}")
+            error_msg = f"Image generation failed: {str(e)}. Let me help with text instead."
+            if do_stream:
+                async def err_stream():
+                    yield sse({"type": "conversation_id", "conversation_id": conv_id})
+                    yield sse({"type": "token", "text": error_msg})
+                    yield sse({"type": "done"})
+                return StreamingResponse(err_stream(), media_type="text/event-stream")
+            return {"reply": error_msg, "conversation_id": conv_id}
 
-    # Create/get conversation
+    # --- Research / Web Search ---
+    search_context = ""
+    search_html = ""
+    if intent_result.intent == IntentCategory.RESEARCH:
+        search_context, search_html = await perform_web_search_formatted(prompt)
+
+    # --- Model Selection ---
+    route = MODEL_ROUTING.get(model_key, MODEL_ROUTING["helox"])
+    use_model = route["chat"]
+    provider = route["provider"]
+
+    # --- Build Messages ---
     conv_id = await get_or_create_conversation(
-        user_id=user["id"], proposed_id=conv_id, title=prompt
+        user_id=user["id"],
+        proposed_id=conversation_id,
+        title=prompt[:50]
     )
     await save_message(user["id"], conv_id, "user", prompt)
 
-    # ===========================
-    # IMAGE GENERATION PATH
-    # ===========================
-    if is_image_request:
-        async def image_event_gen():
-            task = asyncio.current_task()
-            active_streams[user["id"]] = task
-            try:
-                yield sse({"type": "status", "message": "Generating image..."})
+    history = await get_history(conv_id, limit=4)
+    system_prompt = get_system_prompt(prompt)
 
-                image_b64 = await generate_image_openai_sync(
-                    prompt=prompt, size=image_size, quality=image_quality
-                )
+    messages = [{"role": "system", "content": system_prompt}]
 
-                data_url = f"data:image/png;base64,{image_b64}"
-
-                # Structured media event — frontend's onMedia() handles this
-                yield sse({
-                    "type": "media",
-                    "media_type": "image",
-                    "data": [{"url": data_url, "name": "Generated Image"}]
-                })
-
-                # Save as markdown for history
-                md_image = f"![Generated Image]({data_url})"
-                await save_message(user["id"], conv_id, "assistant", md_image)
-                yield sse({"type": "done"})
-
-            except Exception as e:
-                logger.error(f"Image stream error: {e}")
-                yield sse({"type": "error", "message": str(e)})
-            finally:
-                active_streams.pop(user["id"], None)
-
-        if stream:
-            return StreamingResponse(
-                image_event_gen(), media_type="text/event-stream"
+    # Add search context if available
+    if search_context:
+        messages.append({
+            "role": "system",
+            "content": (
+                f"Web search results:\n{search_context}\n\n"
+                "Use these results to inform your answer. "
+                "Cite sources as [1], [2] etc."
             )
-        else:
-            try:
-                image_b64 = await generate_image_openai_sync(
-                    prompt=prompt, size=image_size, quality=image_quality
-                )
-                data_url = f"data:image/png;base64,{image_b64}"
-                md_image = f"![Generated Image]({data_url})"
-                await save_message(user["id"], conv_id, "assistant", md_image)
-                return {"reply": md_image, "conversation_id": conv_id}
-            except Exception as e:
-                logger.error(f"Image generation error: {e}")
-                raise HTTPException(500, str(e))
+        })
 
-    # ===========================
-    # TEXT/CHAT PATH
-    # ===========================
-    if stream:
-        async def event_gen():
+    # Add history (skip the last user message since we just saved it)
+    for msg in history[:-1]:
+        messages.append(msg)
+
+    messages.append({"role": "user", "content": prompt})
+
+    # --- Stream Response ---
+    if do_stream:
+        async def chat_stream():
             task = asyncio.current_task()
             active_streams[user["id"]] = task
             try:
+                yield sse({"type": "conversation_id", "conversation_id": conv_id})
+
+                if search_html:
+                    yield sse({"type": "search_results", "html": search_html})
+
                 full_text = ""
-                search_context = ""
-                search_html = ""
 
-                if needs_search:
-                    yield sse({"type": "status", "message": "Searching the web..."})
-                    search_context, search_html = await perform_web_search_formatted(prompt)
-
-                    if search_html:
-                        yield sse({"type": "token", "text": search_html})
-
-                    yield sse({"type": "status", "message": "Analyzing results..."})
-                else:
-                    yield sse({"type": "status", "message": "Thinking..."})
-
-                history = await get_history(conv_id)
-
-                # Select system prompt based on mode
-                if force_code_prompt:
-                    system_prompt = CODE_ANALYSIS_SYSTEM_PROMPT
-                elif force_finance_prompt:
-                    system_prompt = FINANCE_SYSTEM_PROMPT
-                else:
-                    system_prompt = get_system_prompt(prompt)
-
-                if search_context:
-                    system_prompt += (
-                        f"\n\nWEB SEARCH RESULTS:\n{search_context}\n\n"
-                        "Use these results to answer. "
-                        "Cite sources as [1], [2] etc. "
-                        "Include a 'Sources' section at the bottom with full URLs."
-                    )
-
-                messages = [{"role": "system", "content": system_prompt}] + history
-
-                # Route to correct provider based on model selection
-                if model_config["provider"] == "openai" and OPENAI_API_KEY:
-                    async for token in stream_openai_chat(
-                        messages, model_config["chat"]
-                    ):
+                if provider == "openai":
+                    async for token in stream_openai_chat(messages, model=use_model):
                         if task.cancelled():
                             break
                         full_text += token
                         yield sse({"type": "token", "text": token})
                 else:
-                    async for token in stream_groq_chat(
-                        messages, model=model_config["chat"]
-                    ):
+                    async for token in stream_groq_chat(messages, model=use_model):
                         if task.cancelled():
                             break
                         full_text += token
@@ -1539,281 +1583,356 @@ async def ask_universal(req: Request, res: Response):
 
                 await save_message(user["id"], conv_id, "assistant", full_text)
                 yield sse({"type": "done"})
-
             except Exception as e:
-                logger.error(f"Stream error: {e}")
+                logger.error(f"Chat stream error: {e}")
                 yield sse({"type": "error", "message": str(e)})
             finally:
                 active_streams.pop(user["id"], None)
 
-        return StreamingResponse(event_gen(), media_type="text/event-stream")
-
+        return StreamingResponse(chat_stream(), media_type="text/event-stream")
     else:
-        # Non-streaming path
-        search_context = ""
-        if needs_search:
-            search_context, _ = await perform_web_search_formatted(prompt)
-
-        history = await get_history(conv_id)
-
-        if force_code_prompt:
-            system_prompt = CODE_ANALYSIS_SYSTEM_PROMPT
-        elif force_finance_prompt:
-            system_prompt = FINANCE_SYSTEM_PROMPT
-        else:
-            system_prompt = get_system_prompt(prompt)
-
-        if search_context:
-            system_prompt += (
-                f"\n\nWEB SEARCH RESULTS:\n{search_context}\n\n"
-                "Use these results to answer. Cite sources as [1], [2] etc."
-            )
-
-        messages = [{"role": "system", "content": system_prompt}] + history
-
         try:
-            if model_config["provider"] == "openai" and OPENAI_API_KEY:
-                reply = await openai_chat_sync(
-                    messages, model_config["chat"]
-                )
+            if provider == "openai":
+                reply = await openai_chat_sync(messages, model=use_model)
             else:
-                reply = await groq_chat_sync(
-                    messages, model=model_config["chat"]
-                )
+                reply = await groq_chat_sync(messages, model=use_model)
 
             await save_message(user["id"], conv_id, "assistant", reply)
             return {"reply": reply, "conversation_id": conv_id}
         except Exception as e:
-            logger.error(f"Non-stream chat error: {e}")
-            raise HTTPException(
-                429, "Rate limit exceeded. Please wait a minute before trying again."
-            )
+            logger.error(f"Chat error: {e}")
+            raise HTTPException(500, str(e))
 
 
 # =========================
-# CHAT MANAGEMENT
+# NEW CHAT ENDPOINT
 # =========================
 @app.post("/newchat")
 async def new_chat(req: Request, res: Response):
-    user = await get_user_with_auth(req, res)
-    new_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-    await _execute_supabase_with_retry(
-        supabase.table("conversations").insert({
-            "id": new_id,
-            "user_id": user["id"],
-            "title": "New Chat",
-            "created_at": now,
-            "updated_at": now,
-        })
+    body = {}
+    content_type = req.headers.get("content-type", "")
+
+    if "application/json" in content_type:
+        body = await req.json()
+    else:
+        try:
+            body = await req.json()
+        except Exception:
+            body = {}
+
+    remember = body.get("remember", True)
+    user = await get_user_with_auth(req, res, remember)
+
+    conv_id = await get_or_create_conversation(
+        user_id=user["id"],
+        proposed_id=None,
+        title="New Chat"
     )
-    return {"conversation_id": new_id, "status": "created"}
+
+    return {
+        "conversation_id": conv_id,
+        "message": "New conversation created"
+    }
 
 
+# =========================
+# LIST CHATS ENDPOINT
+# =========================
+@app.get("/chats")
+async def list_chats(req: Request, res: Response):
+    user = await get_user_with_auth(req, res)
+
+    result = await _execute_supabase_with_retry(
+        supabase.table("conversations")
+        .select("id, title, created_at, updated_at")
+        .eq("user_id", user["id"])
+        .order("updated_at", desc=True)
+        .limit(100)
+    )
+
+    chats = []
+    for c in (result.data or []):
+        # Get message count for each conversation
+        msg_result = await _execute_supabase_with_retry(
+            supabase.table("messages")
+            .select("id", count="exact")
+            .eq("conversation_id", c["id"])
+        )
+        msg_count = msg_result.count if hasattr(msg_result, 'count') else 0
+
+        chats.append({
+            "id": c["id"],
+            "title": c.get("title", "Untitled"),
+            "created_at": c.get("created_at"),
+            "updated_at": c.get("updated_at"),
+            "message_count": msg_count
+        })
+
+    return {"chats": chats}
+
+
+# =========================
+# DELETE CHAT ENDPOINT
+# =========================
 @app.delete("/chats/{chat_id}")
 async def delete_chat(chat_id: str, req: Request, res: Response):
     user = await get_user_with_auth(req, res)
 
+    # Verify ownership
     check = await _execute_supabase_with_retry(
         supabase.table("conversations")
-        .select("id, user_id")
+        .select("id")
         .eq("id", chat_id)
         .eq("user_id", user["id"])
         .limit(1)
     )
 
     if not check.data:
-        logger.warning(
-            f"DELETE /chats/{chat_id}: "
-            f"Chat not found or not owned by user {user['id']}"
-        )
-        raise HTTPException(404, "Chat not found")
+        raise HTTPException(404, "Conversation not found")
 
-    try:
-        await _execute_supabase_with_retry(
-            supabase.table("messages")
-            .delete()
-            .eq("conversation_id", chat_id)
-        )
-    except Exception as e:
-        logger.error(f"Failed to delete messages for chat {chat_id}: {e}")
-
-    try:
-        await _execute_supabase_with_retry(
-            supabase.table("conversations")
-            .delete()
-            .eq("id", chat_id)
-            .eq("user_id", user["id"])
-        )
-    except Exception as e:
-        logger.error(f"Failed to delete chat {chat_id}: {e}")
-        raise HTTPException(500, "Failed to delete chat")
-
-    logger.info(f"Deleted chat {chat_id} and its messages for user {user['id']}")
-    return {"status": "deleted", "conversation_id": chat_id}
-
-
-@app.get("/chats")
-async def list_chats(
-    req: Request,
-    res: Response,
-    limit: int = Query(50, le=100),
-    offset: int = Query(0, ge=0)
-):
-    user = await get_user_with_auth(req, res)
-    result = await _execute_supabase_with_retry(
-        supabase.table("conversations")
-        .select("*")
-        .eq("user_id", user["id"])
-        .order("updated_at", desc=True)
-        .range(offset, offset + limit - 1)
-    )
-    return {"chats": result.data}
-
-
-@app.get("/chat/{conversation_id}/messages")
-async def get_messages(conversation_id: str):
-    msgs = await _execute_supabase_with_retry(
+    # Delete messages first
+    await _execute_supabase_with_retry(
         supabase.table("messages")
-        .select("role, content, created_at")
+        .delete()
+        .eq("conversation_id", chat_id)
+    )
+
+    # Delete conversation
+    await _execute_supabase_with_retry(
+        supabase.table("conversations")
+        .delete()
+        .eq("id", chat_id)
+    )
+
+    # Cancel active stream if any
+    if user["id"] in active_streams:
+        active_streams[user["id"]].cancel()
+        active_streams.pop(user["id"], None)
+
+    return {"message": "Conversation deleted", "conversation_id": chat_id}
+
+
+# =========================
+# GET MESSAGES ENDPOINT
+# =========================
+@app.get("/chat/{conversation_id}/messages")
+async def get_messages(conversation_id: str, req: Request, res: Response):
+    user = await get_user_with_auth(req, res)
+
+    # Verify ownership
+    check = await _execute_supabase_with_retry(
+        supabase.table("conversations")
+        .select("id")
+        .eq("id", conversation_id)
+        .eq("user_id", user["id"])
+        .limit(1)
+    )
+
+    if not check.data:
+        raise HTTPException(404, "Conversation not found")
+
+    result = await _execute_supabase_with_retry(
+        supabase.table("messages")
+        .select("id, role, content, created_at")
         .eq("conversation_id", conversation_id)
         .order("created_at", desc=False)
     )
-    return {"messages": msgs.data}
+
+    return {"messages": result.data or []}
 
 
 # =========================
-# TTS / STT
+# TTS ENDPOINT
 # =========================
 @app.post("/tts")
-async def text_to_speech(req: Request):
-    data = await req.json()
-    text = data.get("text")
-    voice = data.get("voice", "alloy")
+async def text_to_speech(req: Request, res: Response):
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "OpenAI API Key not configured for TTS")
 
-    allowed_voices = ["alloy", "onyx", "nova", "shimmer", "echo", "fable"]
-    if voice not in allowed_voices:
+    user = await get_user_with_auth(req, res)
+    body = await req.json()
+
+    text = body.get("text", "")
+    voice = body.get("voice", "alloy")
+
+    valid_voices = ["alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer"]
+    if voice not in valid_voices:
         voice = "alloy"
 
-    if not text:
-        raise HTTPException(400, "text required")
-    if not OPENAI_API_KEY:
-        raise HTTPException(500, "Missing OpenAI API Key")
+    if not text.strip():
+        raise HTTPException(400, "Text is required")
 
-    async def stream_audio():
+    # Trim text to TTS limits
+    text = text[:4096]
+
+    try:
         async with httpx.AsyncClient(timeout=60) as client:
-            async with client.stream(
-                "POST",
+            resp = await client.post(
                 "https://api.openai.com/v1/audio/speech",
                 headers=get_openai_headers(),
                 json={
                     "model": OPENAI_TTS_MODEL,
-                    "voice": voice,
                     "input": text,
+                    "voice": voice,
                     "response_format": "mp3"
                 }
-            ) as response:
-                if response.status_code != 200:
-                    error_body = await response.aread()
-                    logger.error(
-                        f"OpenAI TTS Error {response.status_code}: "
-                        f"{error_body.decode()}"
-                    )
-                    return
-                async for chunk in response.aiter_bytes():
-                    yield chunk
+            )
+            resp.raise_for_status()
 
-    return StreamingResponse(stream_audio(), media_type="audio/mpeg")
+            return Response(
+                content=resp.content,
+                media_type="audio/mpeg",
+                headers={
+                    "Content-Disposition": "inline; filename=speech.mp3"
+                }
+            )
+    except httpx.HTTPStatusError as e:
+        logger.error(f"TTS Error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(500, f"TTS generation failed: {e.response.text}")
+    except Exception as e:
+        logger.error(f"TTS Error: {e}")
+        raise HTTPException(500, f"TTS generation failed: {str(e)}")
 
 
+# =========================
+# TTS VOICES ENDPOINT
+# =========================
 @app.get("/tts/voices")
-async def get_voices():
-    return {
-        "voices": [
-            {"id": "alloy", "name": "Alloy"},
-            {"id": "fable", "name": "Fable"},
-            {"id": "onyx", "name": "Onyx"},
-            {"id": "nova", "name": "Nova"},
-            {"id": "shimmer", "name": "Shimmer"},
-            {"id": "echo", "name": "Echo"}
-        ]
-    }
+async def list_tts_voices(req: Request, res: Response):
+    await get_user_with_auth(req, res)
 
-
-@app.post("/stt")
-async def speech_to_text(file: UploadFile = File(...)):
-    if not GROQ_API_KEY:
-        raise HTTPException(500, "Missing Groq API Key")
-
-    allowed_types = [
-        "audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav",
-        "audio/webm", "audio/ogg", "audio/flac", "audio/m4a",
-        "video/mp4", "video/webm"
+    voices = [
+        {"id": "alloy", "name": "Alloy", "description": "Balanced and neutral"},
+        {"id": "ash", "name": "Ash", "description": "Warm and conversational"},
+        {"id": "ballad", "name": "Ballad", "description": "Smooth and melodic"},
+        {"id": "coral", "name": "Coral", "description": "Clear and engaging"},
+        {"id": "echo", "name": "Echo", "description": "Deep and authoritative"},
+        {"id": "fable", "name": "Fable", "description": "Expressive and storytelling"},
+        {"id": "onyx", "name": "Onyx", "description": "Deep and professional"},
+        {"id": "nova", "name": "Nova", "description": "Friendly and upbeat"},
+        {"id": "sage", "name": "Sage", "description": "Calm and wise"},
+        {"id": "shimmer", "name": "Shimmer", "description": "Soft and gentle"},
     ]
-    if file.content_type and file.content_type not in allowed_types:
-        logger.warning(f"STT: Unexpected content type: {file.content_type}")
 
-    content = b""
+    return {"voices": voices}
+
+
+# =========================
+# STT ENDPOINT
+# =========================
+@app.post("/stt")
+async def speech_to_text(
+    req: Request,
+    res: Response,
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+):
+    if not GROQ_API_KEY:
+        raise HTTPException(500, "Groq API Key not configured for STT")
+
+    user = await get_user_with_auth(req, res)
+
+    # Read audio file
+    audio_bytes = b""
     while chunk := await file.read(1024 * 1024):
-        content += chunk
-        if len(content) > 25 * 1024 * 1024:
-            raise HTTPException(400, "Audio file too large. Maximum size is 25MB.")
+        audio_bytes += chunk
+        if len(audio_bytes) > MAX_FILE_SIZE:
+            raise HTTPException(413, "Audio file too large")
 
-    if len(content) == 0:
+    if len(audio_bytes) == 0:
         raise HTTPException(400, "Empty audio file")
+
+    # Determine file extension for Groq
+    filename = file.filename or "audio.wav"
+    ext = Path(filename).suffix.lower()
+
+    # Groq expects specific formats
+    valid_extensions = {'.wav', '.mp3', '.mp4', '.m4a', '.webm', '.ogg', '.flac'}
+    if ext not in valid_extensions:
+        # Default to wav
+        ext = ".wav"
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            files = {
-                "file": (
-                    file.filename or "audio.mp3",
-                    content,
-                    file.content_type or "audio/mpeg"
-                )
-            }
-            data = {"model": GROQ_STT_MODEL, "response_format": "json"}
-
-            r = await client.post(
+            resp = await client.post(
                 "https://api.groq.com/openai/v1/audio/transcriptions",
                 headers=get_groq_headers_multipart(),
-                files=files,
-                data=data
+                files={
+                    "file": (f"audio{ext}", audio_bytes, f"audio/{ext[1:]}")
+                },
+                data={
+                    "model": GROQ_STT_MODEL,
+                    "language": language or "en",
+                    "response_format": "json"
+                }
             )
-            if r.status_code != 200:
-                error_detail = r.text
-                logger.error(f"Groq STT Error {r.status_code}: {error_detail}")
-                raise HTTPException(
-                    status_code=r.status_code,
-                    detail=f"Groq STT failed: {error_detail}"
-                )
+            resp.raise_for_status()
+            result = resp.json()
 
-            result = r.json()
             return {
                 "text": result.get("text", ""),
-                "model": GROQ_STT_MODEL,
-                "provider": "groq"
+                "language": language or "en"
             }
-    except httpx.TimeoutException:
-        raise HTTPException(504, "Speech transcription timed out")
-    except HTTPException:
-        raise
+    except httpx.HTTPStatusError as e:
+        logger.error(f"STT Error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(500, f"Speech-to-text failed: {e.response.text}")
     except Exception as e:
         logger.error(f"STT Error: {e}")
-        raise HTTPException(500, f"Speech to text failed: {str(e)}")
+        raise HTTPException(500, f"Speech-to-text failed: {str(e)}")
 
 
 # =========================
-# SESSION
+# LOGOUT ENDPOINT
 # =========================
 @app.post("/session/logout")
 async def logout(req: Request, res: Response):
+    user_id = req.cookies.get(PRIMARY_COOKIE)
+    token = req.cookies.get(SESSION_TOKEN_COOKIE)
+
+    if user_id and token:
+        try:
+            # Invalidate session in DB
+            await _execute_supabase_with_retry(
+                supabase.table("user_sessions")
+                .update({"is_valid": False})
+                .eq("user_id", user_id)
+                .eq("token", token)
+            )
+            # Clear cache
+            _session_cache.pop(user_id, None)
+        except Exception as e:
+            logger.error(f"Logout error: {e}")
+
+    # Cancel active stream if any
+    if user_id and user_id in active_streams:
+        active_streams[user_id].cancel()
+        active_streams.pop(user_id, None)
+
     clear_session_cookies(res)
-    return {"status": "logged_out"}
+    return {"message": "Logged out successfully"}
 
 
 # =========================
-# MAIN
+# PERIODIC CLEANUP (OPTIONAL)
 # =========================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+async def _cleanup_stale_locks():
+    """Periodically clean up stale conversation creation locks."""
+    while True:
+        await asyncio.sleep(300)  # Every 5 minutes
+        if _conv_creation_locks:
+            logger.debug(f"Cleaning up {len(_conv_creation_locks)} stale conv locks")
+            _conv_creation_locks.clear()
+
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(_cleanup_stale_locks())
+    logger.info("HeloxAi Lite v4.0.0 started")
+
+
+# =========================
+# HEALTH CHECK
+# =========================
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
