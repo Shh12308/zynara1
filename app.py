@@ -1430,179 +1430,350 @@ async def analyze_file_json(req: Request, res: Response):
 # =========================
 # UNIVERSAL CHAT ENDPOINT (COMPLETE)
 # =========================
+# Add this to your backend.py - Complete the ask/universal endpoint
+
 @app.post("/ask/universal")
-async def ask_universal(req: Request, res: Response):
-    content_type = req.headers.get("content-type", "")
-    body = {}
-
-    if "application/json" in content_type:
-        body = await req.json()
-    elif "multipart/form-data" in content_type:
-        form = await req.form()
-        body = {}
-        for key in form:
-            val = form[key]
-            if isinstance(val, UploadFile):
-                content_bytes = b""
-                while chunk := await val.read(1024 * 1024):
-                    content_bytes += chunk
-                    if len(content_bytes) > MAX_FILE_SIZE:
-                        raise HTTPException(413, "File too large")
-                text_content = await extract_text_safe(content_bytes)
-                body["prompt"] = body.get("prompt", "") + (
-                    f"\n\n[FILE CONTENT: {val.filename}]\n"
-                    f"{text_content}\n[END FILE]\n"
-                )
-            else:
-                body[key] = val
-
-    prompt = body.get("prompt", "")
-    if not prompt.strip():
-        raise HTTPException(400, "Prompt is required.")
-
-    conversation_id = body.get("conversation_id")
-    do_stream = body.get("stream", True)
-    remember = body.get("remember", True)
-    image_size = body.get("image_size", "1024x1024")
-    image_quality = body.get("image_quality", "medium")
-    model_key = body.get("model", "helox").lower()
-
-    user = await get_user_with_auth(req, res, remember)
-
-    # --- Intent Detection ---
-    intent_result = _detector.detect(prompt)
-
-    # --- Image Generation ---
-    if intent_result.intent == IntentCategory.IMAGE_GENERATION:
-        conv_id = await get_or_create_conversation(
-            user_id=user["id"],
-            proposed_id=conversation_id,
-            title=prompt[:50]
-        )
-        await save_message(user["id"], conv_id, "user", prompt)
-
+async def ask_universal(
+    req: Request,
+    res: Response,
+    body: Optional[ChatRequest] = None,
+    stream: bool = Form(True),
+    prompt: Optional[str] = Form(None),
+    conversation_id: Optional[str] = Form(None),
+    remember: bool = Form(True),
+    model: Optional[str] = Form(None),
+    mode: Optional[str] = Form("general"),
+    image_size: Optional[str] = Form("1024x1024"),
+    image_quality: Optional[str] = Form("medium"),
+    image_base64: Optional[str] = Form(None),
+    image_mime: Optional[str] = Form("image/png"),
+):
+    """
+    Universal endpoint that handles:
+    - Regular chat (streaming)
+    - Image generation
+    - Web search
+    - Vision analysis
+    - Model routing
+    - Mode routing
+    """
+    # Handle both JSON and multipart
+    if body is None:
         try:
-            image_b64 = await generate_image_openai_sync(
-                prompt, size=image_size, quality=image_quality
+            raw = await req.json()
+            body = ChatRequest(**raw)
+        except:
+            if not prompt:
+                raise HTTPException(400, "No prompt provided")
+            body = ChatRequest(
+                prompt=prompt,
+                conversation_id=conversation_id,
+                stream=stream,
+                remember=remember,
+                image_size=image_size or "1024x1024",
+                image_quality=image_quality or "medium"
             )
-            img_html = (
-                f'<img src="data:image/png;base64,{image_b64}" '
-                f'alt="Generated image" class="generated-image">'
-            )
-            await save_message(user["id"], conv_id, "assistant", img_html)
+    
+    # Override with form data if provided
+    if prompt:
+        body.prompt = prompt
+    if conversation_id:
+        body.conversation_id = conversation_id
+    if model:
+        body.model = model
+    if mode:
+        body.mode = mode
 
-            if do_stream:
-                async def img_stream():
-                    yield sse({"type": "conversation_id", "conversation_id": conv_id})
-                    yield sse({"type": "image", "image": image_b64})
-                    yield sse({"type": "done"})
-                return StreamingResponse(img_stream(), media_type="text/event-stream")
-            else:
-                return {
-                    "reply": img_html,
-                    "conversation_id": conv_id,
-                    "type": "image"
-                }
-        except Exception as e:
-            logger.error(f"Image generation failed: {e}")
-            error_msg = f"Image generation failed: {str(e)}. Let me help with text instead."
-            if do_stream:
-                async def err_stream():
-                    yield sse({"type": "conversation_id", "conversation_id": conv_id})
-                    yield sse({"type": "token", "text": error_msg})
-                    yield sse({"type": "done"})
-                return StreamingResponse(err_stream(), media_type="text/event-stream")
-            return {"reply": error_msg, "conversation_id": conv_id}
-
-    # --- Research / Web Search ---
-    search_context = ""
-    search_html = ""
-    if intent_result.intent == IntentCategory.RESEARCH:
-        search_context, search_html = await perform_web_search_formatted(prompt)
-
-    # --- Model Selection ---
-    route = MODEL_ROUTING.get(model_key, MODEL_ROUTING["helox"])
-    use_model = route["chat"]
-    provider = route["provider"]
-
-    # --- Build Messages ---
+    user = await get_user_with_auth(req, res, body.remember)
+    
+    # Get or create conversation
     conv_id = await get_or_create_conversation(
         user_id=user["id"],
-        proposed_id=conversation_id,
-        title=prompt[:50]
+        proposed_id=body.conversation_id,
+        title=body.prompt[:50]
     )
-    await save_message(user["id"], conv_id, "user", prompt)
+    
+    # Detect intent
+    intent = _detector.detect(body.prompt)
+    
+    # Check if this is an image generation request
+    if intent.intent == IntentCategory.IMAGE_GENERATION and intent.confidence > 0.6:
+        return await handle_image_generation(
+            user=user,
+            conv_id=conv_id,
+            prompt=body.prompt,
+            size=body.image_size,
+            quality=body.image_quality,
+            stream=body.stream
+        )
+    
+    # Build messages for chat
+    messages = await build_chat_messages(
+        user_id=user["id"],
+        conv_id=conv_id,
+        prompt=body.prompt,
+        mode=mode or "general",
+        image_base64=image_base64,
+        image_mime=image_mime,
+        model=model or "helox"
+    )
+    
+    # Get the appropriate model and provider
+    selected_model = model or "helox"
+    model_config = MODEL_ROUTING.get(selected_model, MODEL_ROUTING["helox"])
+    use_model = model_config["chat"]
+    provider = model_config["provider"]
+    
+    # Handle vision (if image provided)
+    if image_base64:
+        use_model = model_config["vision"]
+    
+    # Save user message
+    await save_message(user["id"], conv_id, "user", body.prompt)
+    
+    # Stream response
+    if body.stream:
+        return StreamingResponse(
+            stream_chat_response(
+                user_id=user["id"],
+                conv_id=conv_id,
+                messages=messages,
+                model=use_model,
+                provider=provider,
+                mode=mode or "general",
+                prompt=body.prompt
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # Nginx disable buffering
+            }
+        )
+    else:
+        # Non-streaming response
+        if provider == "openai":
+            reply = await openai_chat_sync(messages, model=use_model)
+        else:
+            reply = await groq_chat_sync(messages, model=use_model)
+        
+        await save_message(user["id"], conv_id, "assistant", reply)
+        return {"reply": reply, "conversation_id": conv_id}
 
-    history = await get_history(conv_id, limit=4)
-    system_prompt = get_system_prompt(prompt)
 
-    messages = [{"role": "system", "content": system_prompt}]
-
-    # Add search context if available
-    if search_context:
-        messages.append({
-            "role": "system",
-            "content": (
-                f"Web search results:\n{search_context}\n\n"
-                "Use these results to inform your answer. "
-                "Cite sources as [1], [2] etc."
+async def handle_image_generation(
+    user: Dict,
+    conv_id: str,
+    prompt: str,
+    size: str,
+    quality: str,
+    stream: bool
+):
+    """Handle image generation requests."""
+    
+    async def image_gen_stream():
+        try:
+            yield sse({"type": "conversation_id", "conversation_id": conv_id})
+            yield sse({"type": "status", "message": "Generating image..."})
+            
+            # Generate image
+            image_b64 = await generate_image_openai_sync(
+                prompt=prompt,
+                size=size,
+                quality=quality
             )
-        })
-
-    # Add history (skip the last user message since we just saved it)
-    for msg in history[:-1]:
-        messages.append(msg)
-
-    messages.append({"role": "user", "content": prompt})
-
-    # --- Stream Response ---
-    if do_stream:
-        async def chat_stream():
-            task = asyncio.current_task()
-            active_streams[user["id"]] = task
-            try:
-                yield sse({"type": "conversation_id", "conversation_id": conv_id})
-
-                if search_html:
-                    yield sse({"type": "search_results", "html": search_html})
-
-                full_text = ""
-
-                if provider == "openai":
-                    async for token in stream_openai_chat(messages, model=use_model):
-                        if task.cancelled():
-                            break
-                        full_text += token
-                        yield sse({"type": "token", "text": token})
-                else:
-                    async for token in stream_groq_chat(messages, model=use_model):
-                        if task.cancelled():
-                            break
-                        full_text += token
-                        yield sse({"type": "token", "text": token})
-
-                await save_message(user["id"], conv_id, "assistant", full_text)
-                yield sse({"type": "done"})
-            except Exception as e:
-                logger.error(f"Chat stream error: {e}")
-                yield sse({"type": "error", "message": str(e)})
-            finally:
-                active_streams.pop(user["id"], None)
-
-        return StreamingResponse(chat_stream(), media_type="text/event-stream")
+            
+            # Create data URL
+            data_url = f"data:image/png;base64,{image_b64}"
+            
+            # Send image data
+            yield sse({
+                "type": "image",
+                "url": data_url,
+                "prompt": prompt
+            })
+            
+            # Save message with image reference
+            ai_response = f"Here's the generated image based on your prompt: '{prompt}'"
+            await save_message(user["id"], conv_id, "assistant", ai_response)
+            
+            yield sse({"type": "done"})
+            
+        except Exception as e:
+            logger.error(f"Image generation error: {e}")
+            yield sse({"type": "error", "message": str(e)})
+    
+    if stream:
+        return StreamingResponse(
+            image_gen_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
     else:
         try:
-            if provider == "openai":
-                reply = await openai_chat_sync(messages, model=use_model)
-            else:
-                reply = await groq_chat_sync(messages, model=use_model)
-
-            await save_message(user["id"], conv_id, "assistant", reply)
-            return {"reply": reply, "conversation_id": conv_id}
+            image_b64 = await generate_image_openai_sync(prompt, size, quality)
+            data_url = f"data:image/png;base64,{image_b64}"
+            ai_response = f"Here's the generated image based on your prompt: '{prompt}'"
+            await save_message(user["id"], conv_id, "assistant", ai_response)
+            return {
+                "reply": ai_response,
+                "conversation_id": conv_id,
+                "image_url": data_url
+            }
         except Exception as e:
-            logger.error(f"Chat error: {e}")
             raise HTTPException(500, str(e))
 
+
+async def build_chat_messages(
+    user_id: str,
+    conv_id: str,
+    prompt: str,
+    mode: str,
+    image_base64: Optional[str] = None,
+    image_mime: str = "image/png",
+    model: str = "helox"
+) -> list:
+    """Build the message array for the AI API."""
+    
+    # Get conversation history
+    history = await get_history(conv_id, limit=6)
+    
+    # Select system prompt based on mode
+    if mode == "finance":
+        system_prompt = FINANCE_SYSTEM_PROMPT
+    else:
+        system_prompt = BASE_SYSTEM_PROMPT
+    
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    # Add history
+    messages.extend(history)
+    
+    # Build user message
+    if image_base64:
+        # Vision message
+        clean_b64 = image_base64
+        if "," in image_base64:
+            clean_b64 = image_base64.split(",", 1)[1]
+        
+        user_content = [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{image_mime};base64,{clean_b64}"}
+            },
+            {"type": "text", "text": prompt}
+        ]
+        messages.append({"role": "user", "content": user_content})
+    else:
+        messages.append({"role": "user", "content": prompt})
+    
+    return messages
+
+
+async def stream_chat_response(
+    user_id: str,
+    conv_id: str,
+    messages: list,
+    model: str,
+    provider: str,
+    mode: str,
+    prompt: str
+):
+    """Stream chat response with search integration."""
+    
+    task = asyncio.current_task()
+    active_streams[user_id] = task
+    
+    try:
+        yield sse({"type": "conversation_id", "conversation_id": conv_id})
+        
+        # Perform web search if needed (research/finance mode or search keywords)
+        search_context = ""
+        search_html = ""
+        
+        if mode in ["search", "finance", "research"]:
+            yield sse({"type": "status", "message": "Searching..."})
+            search_context, search_html = await perform_web_search_formatted(prompt)
+            
+            if search_html:
+                yield sse({"type": "search_results", "html": search_html})
+            
+            if search_context and search_context != "[Search API Key missing]" and search_context != "[No search results found]":
+                # Inject search context into messages
+                search_augmented = f"""[Web Search Results]
+{search_context}
+
+[User Question]
+{prompt}
+
+Based on the search results above, provide a comprehensive answer. Cite sources as [1], [2], etc."""
+                # Update the last user message
+                messages[-1] = {"role": "user", "content": search_augmented}
+        
+        # Stream the response
+        full_text = ""
+        token_count = 0
+        
+        if provider == "openai":
+            stream_fn = stream_openai_chat(messages, model=model)
+        else:
+            stream_fn = stream_groq_chat(messages, model=model)
+        
+        async for token in stream_fn:
+            if task.cancelled():
+                break
+            
+            full_text += token
+            token_count += 1
+            
+            # Send token with metadata
+            yield sse({
+                "type": "token",
+                "text": token,
+                "token_count": token_count
+            })
+            
+            # Periodically save partial content (for recovery)
+            if token_count % 50 == 0:
+                yield sse({"type": "heartbeat", "chars": len(full_text)})
+        
+        # Save complete response
+        if full_text:
+            await save_message(user["id"], conv_id, "assistant", full_text)
+        
+        yield sse({"type": "done", "total_chars": len(full_text)})
+        
+    except asyncio.CancelledError:
+        logger.info(f"Stream cancelled for user {user_id}")
+        # Save partial response
+        if full_text:
+            await save_message(user["id"], conv_id, "assistant", full_text + "\n[Response interrupted]")
+        yield sse({"type": "cancelled"})
+        
+    except httpx.RemoteProtocolError as e:
+        logger.error(f"Connection error: {e}")
+        yield sse({"type": "error", "message": "Connection lost. Please retry.", "code": "CONNECTION_LOST"})
+        
+    except Exception as e:
+        logger.error(f"Stream error: {e}")
+        yield sse({"type": "error", "message": str(e)})
+        
+    finally:
+        active_streams.pop(user_id, None)
+
+
+@app.post("/stop/{user_id}")
+async def stop_streaming(user_id: str, req: Request):
+    """Stop an active stream for a user."""
+    task = active_streams.get(user_id)
+    if task and not task.done():
+        task.cancel()
+        return {"status": "cancelled"}
+    return {"status": "no_active_stream"}
 
 # =========================
 # NEW CHAT ENDPOINT
@@ -1803,12 +1974,6 @@ async def list_tts_voices(req: Request, res: Response):
 
     voices = [
         {"id": "alloy", "name": "Alloy", "description": "Balanced and neutral"},
-        {"id": "ash", "name": "Ash", "description": "Warm and conversational"},
-        {"id": "ballad", "name": "Ballad", "description": "Smooth and melodic"},
-        {"id": "coral", "name": "Coral", "description": "Clear and engaging"},
-        {"id": "echo", "name": "Echo", "description": "Deep and authoritative"},
-        {"id": "fable", "name": "Fable", "description": "Expressive and storytelling"},
-        {"id": "onyx", "name": "Onyx", "description": "Deep and professional"},
         {"id": "nova", "name": "Nova", "description": "Friendly and upbeat"},
         {"id": "sage", "name": "Sage", "description": "Calm and wise"},
         {"id": "shimmer", "name": "Shimmer", "description": "Soft and gentle"},
