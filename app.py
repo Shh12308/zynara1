@@ -548,6 +548,8 @@ class ChatRequest(BaseModel):
     remember: bool = True
     image_size: str = "1024x1024"
     image_quality: str = "medium"
+    model: Optional[str] = "helox"
+    mode: Optional[str] = "general"
 
 
 class AnalysisRequest(BaseModel):
@@ -1433,70 +1435,23 @@ async def analyze_file_json(req: Request, res: Response):
 # Add this to your backend.py - Complete the ask/universal endpoint
 
 @app.post("/ask/universal")
-async def ask_universal(
-    req: Request,
-    res: Response,
-    body: Optional[ChatRequest] = None,
-    stream: bool = Form(True),
-    prompt: Optional[str] = Form(None),
-    conversation_id: Optional[str] = Form(None),
-    remember: bool = Form(True),
-    model: Optional[str] = Form(None),
-    mode: Optional[str] = Form("general"),
-    image_size: Optional[str] = Form("1024x1024"),
-    image_quality: Optional[str] = Form("medium"),
-    image_base64: Optional[str] = Form(None),
-    image_mime: Optional[str] = Form("image/png"),
-):
-    """
-    Universal endpoint that handles:
-    - Regular chat (streaming)
-    - Image generation
-    - Web search
-    - Vision analysis
-    - Model routing
-    - Mode routing
-    """
-    # Handle both JSON and multipart
-    if body is None:
-        try:
-            raw = await req.json()
-            body = ChatRequest(**raw)
-        except:
-            if not prompt:
-                raise HTTPException(400, "No prompt provided")
-            body = ChatRequest(
-                prompt=prompt,
-                conversation_id=conversation_id,
-                stream=stream,
-                remember=remember,
-                image_size=image_size or "1024x1024",
-                image_quality=image_quality or "medium"
-            )
-    
-    # Override with form data if provided
-    if prompt:
-        body.prompt = prompt
-    if conversation_id:
-        body.conversation_id = conversation_id
-    if model:
-        body.model = model
-    if mode:
-        body.mode = mode
+async def ask_universal(req: Request, res: Response, body: ChatRequest):
+    """Universal endpoint for chat, search, image gen, and vision."""
+    if not body.prompt:
+        raise HTTPException(400, "Prompt is required")
 
     user = await get_user_with_auth(req, res, body.remember)
-    
-    # Get or create conversation
+
     conv_id = await get_or_create_conversation(
         user_id=user["id"],
         proposed_id=body.conversation_id,
         title=body.prompt[:50]
     )
-    
+
     # Detect intent
     intent = _detector.detect(body.prompt)
-    
-    # Check if this is an image generation request
+
+    # Image generation
     if intent.intent == IntentCategory.IMAGE_GENERATION and intent.confidence > 0.6:
         return await handle_image_generation(
             user=user,
@@ -1506,32 +1461,24 @@ async def ask_universal(
             quality=body.image_quality,
             stream=body.stream
         )
-    
-    # Build messages for chat
+
+    # Build messages
     messages = await build_chat_messages(
         user_id=user["id"],
         conv_id=conv_id,
         prompt=body.prompt,
-        mode=mode or "general",
-        image_base64=image_base64,
-        image_mime=image_mime,
-        model=model or "helox"
+        mode=body.mode,
+        model=body.model
     )
-    
-    # Get the appropriate model and provider
-    selected_model = model or "helox"
-    model_config = MODEL_ROUTING.get(selected_model, MODEL_ROUTING["helox"])
+
+    # Get model config
+    model_config = MODEL_ROUTING.get(body.model, MODEL_ROUTING["helox"])
     use_model = model_config["chat"]
     provider = model_config["provider"]
-    
-    # Handle vision (if image provided)
-    if image_base64:
-        use_model = model_config["vision"]
-    
+
     # Save user message
     await save_message(user["id"], conv_id, "user", body.prompt)
-    
-    # Stream response
+
     if body.stream:
         return StreamingResponse(
             stream_chat_response(
@@ -1540,23 +1487,21 @@ async def ask_universal(
                 messages=messages,
                 model=use_model,
                 provider=provider,
-                mode=mode or "general",
+                mode=body.mode,
                 prompt=body.prompt
             ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",  # Nginx disable buffering
+                "X-Accel-Buffering": "no",
             }
         )
     else:
-        # Non-streaming response
         if provider == "openai":
             reply = await openai_chat_sync(messages, model=use_model)
         else:
             reply = await groq_chat_sync(messages, model=use_model)
-        
         await save_message(user["id"], conv_id, "assistant", reply)
         return {"reply": reply, "conversation_id": conv_id}
 
