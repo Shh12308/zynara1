@@ -1452,7 +1452,9 @@ async def ask_universal(req: Request, res: Response, body: ChatRequest):
     intent = _detector.detect(body.prompt)
 
     # Image generation
+        # Image generation
     if intent.intent == IntentCategory.IMAGE_GENERATION and intent.confidence > 0.6:
+        await save_message(user["id"], conv_id, "user", body.prompt)  # ← ADD THIS
         return await handle_image_generation(
             user=user,
             conv_id=conv_id,
@@ -1514,39 +1516,46 @@ async def handle_image_generation(
     quality: str,
     stream: bool
 ):
-    """Handle image generation requests."""
-    
     async def image_gen_stream():
+        task = asyncio.current_task()
+        active_streams[user["id"]] = task          # ← ADD
         try:
             yield sse({"type": "conversation_id", "conversation_id": conv_id})
             yield sse({"type": "status", "message": "Generating image..."})
             
-            # Generate image
+            if task.cancelled():                     # ← ADD
+                return                               # ← ADD
+                
             image_b64 = await generate_image_openai_sync(
                 prompt=prompt,
                 size=size,
                 quality=quality
             )
             
-            # Create data URL
+            if task.cancelled():                     # ← ADD
+                return                               # ← ADD
+            
             data_url = f"data:image/png;base64,{image_b64}"
             
-            # Send image data
             yield sse({
                 "type": "image",
                 "url": data_url,
                 "prompt": prompt
             })
             
-            # Save message with image reference
             ai_response = f"Here's the generated image based on your prompt: '{prompt}'"
             await save_message(user["id"], conv_id, "assistant", ai_response)
             
             yield sse({"type": "done"})
             
+        except asyncio.CancelledError:               # ← ADD
+            logger.info(f"Image generation cancelled for user {user['id']}")
+            yield sse({"type": "cancelled"})
         except Exception as e:
             logger.error(f"Image generation error: {e}")
             yield sse({"type": "error", "message": str(e)})
+        finally:                                      # ← ADD
+            active_streams.pop(user["id"], None)      # ← ADD
     
     if stream:
         return StreamingResponse(
