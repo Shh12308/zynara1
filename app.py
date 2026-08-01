@@ -46,8 +46,129 @@ REFRESH_THRESHOLD = 7 * 24 * 60 * 60
 
 GROQ_MAX_RETRIES = 3
 
-RATE_LIMIT_REQUESTS = 20
-RATE_LIMIT_WINDOW = 60
+# ══════════════════════════════════════════════
+# RATE LIMITING CONFIGURATION
+# ══════════════════════════════════════════════
+
+# Global IP limits
+IP_RATE_LIMIT = 30          # requests
+IP_RATE_WINDOW = 60         # seconds
+
+# Per-endpoint overrides (stricter for expensive ops)
+ENDPOINT_LIMITS = {
+    "/ask/universal":       {"limit": 20, "window": 60},
+    "/tts":                 {"limit": 10, "window": 60},
+    "/stt":                 {"limit": 10, "window": 60},
+    "/analysis":            {"limit": 15, "window": 60},
+}
+
+# Cleanup stale entries every N seconds
+_RATE_CLEANUP_INTERVAL = 300
+_last_rate_cleanup = 0
+
+# Store: { key: [timestamps] }
+_rate_store: Dict[str, List[float]] = {}
+
+
+def _get_rate_key(client_ip: str, path: str) -> str:
+    """Use IP alone for global, IP+path for per-endpoint."""
+    for ep in ENDPOINT_LIMITS:
+        if path.startswith(ep):
+            return f"{client_ip}:{ep}"
+    return f"{client_ip}:__global__"
+
+
+def _get_limits_for_key(key: str) -> Tuple[int, int]:
+    """Return (limit, window) for a given rate key."""
+    for ep, cfg in ENDPOINT_LIMITS.items():
+        if key.endswith(ep):
+            return cfg["limit"], cfg["window"]
+    return IP_RATE_LIMIT, IP_RATE_WINDOW
+
+
+def _cleanup_rate_store(now: float):
+    """Prune entries older than their window to prevent memory leaks."""
+    global _last_rate_cleanup
+    if now - _last_rate_cleanup < _RATE_CLEANUP_INTERVAL:
+        return
+    _last_rate_cleanup = now
+
+    stale_keys = []
+    for key, timestamps in _rate_store.items():
+        _, window = _get_limits_for_key(key)
+        # Keep only recent timestamps
+        filtered = [t for t in timestamps if now - t < window]
+        if filtered:
+            _rate_store[key] = filtered
+        else:
+            stale_keys.append(key)
+
+    for key in stale_keys:
+        del _rate_store[key]
+
+    if stale_keys:
+        logger.debug(f"Rate store cleanup: pruned {len(stale_keys)} stale keys")
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    # Skip health checks and CORS preflight
+    if request.url.path == "/" or request.method == "OPTIONS":
+        return await call_next(request)
+
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+
+    # Periodic cleanup
+    _cleanup_rate_store(now)
+
+    key = _get_rate_key(client_ip, request.url.path)
+    limit, window = _get_limits_for_key(key)
+
+    if key not in _rate_store:
+        _rate_store[key] = []
+
+    # Sliding window: keep only timestamps within the window
+    _rate_store[key] = [t for t in _rate_store[key] if now - t < window]
+
+    current_count = len(_rate_store[key])
+
+    if current_count >= limit:
+        # Calculate when the oldest request expires → reset time
+        oldest = _rate_store[key][0]
+        reset_at = int(oldest + window)
+        logger.warning(
+            f"Rate limit hit: {key} ({current_count}/{limit})"
+        )
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": "Too many requests. Please slow down.",
+                "limit": limit,
+                "window": window,
+                "reset_at": reset_at,
+            },
+            headers={
+                "X-RateLimit-Limit": str(limit),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(reset_at),
+                "Retry-After": str(max(1, reset_at - int(now))),
+            }
+        )
+
+    # Record this request
+    _rate_store[key].append(now)
+    remaining = limit - current_count - 1
+    reset_at = int(_rate_store[key][0] + window)
+
+    response = await call_next(request)
+
+    # Attach rate limit headers to all responses
+    response.headers["X-RateLimit-Limit"] = str(limit)
+    response.headers["X-RateLimit-Remaining"] = str(max(0, remaining))
+    response.headers["X-RateLimit-Reset"] = str(reset_at)
+
+    return response
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
