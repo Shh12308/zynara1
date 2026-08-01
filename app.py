@@ -776,11 +776,13 @@ async def perform_web_search_formatted(query: str) -> Tuple[str, str]:
                 "search_depth": "basic",
                 "max_results": 5,
                 "include_answer": True,
-                "include_images": False
+                "include_images": True,
+                "include_raw_content": False,
             })
             resp.raise_for_status()
             data = resp.json()
             results = data.get("results", [])
+            raw_images = data.get("images", [])
 
             if not results:
                 return "[No search results found]", ""
@@ -792,7 +794,18 @@ async def perform_web_search_formatted(query: str) -> Tuple[str, str]:
             for i, r in enumerate(results):
                 context += f"[{i+1}] {r['title']}: {r['content']}\nURL: {r['url']}\n\n"
 
-            # Build HTML matching frontend CSS classes
+            # Build image lookup: map domain → first image for that domain
+            domain_images = {}
+            for img_url in raw_images[:20]:
+                try:
+                    parsed = urlparse(img_url)
+                    domain = parsed.hostname or ""
+                    if domain and domain not in domain_images:
+                        domain_images[domain] = img_url
+                except Exception:
+                    pass
+
+            # ── Sources bar ──
             html = '<div class="search-sources-bar">\n'
             html += '<i class="fa-solid fa-globe"></i> Sources:\n'
             for r in results[:5]:
@@ -807,32 +820,54 @@ async def perform_web_search_formatted(query: str) -> Tuple[str, str]:
                 )
             html += '</div>\n\n'
 
-            for i, r in enumerate(results[:3]):
+            # ── Search result cards with real images ──
+            for i, r in enumerate(results[:4]):
                 domain = urlparse(r["url"]).hostname or ""
-                html += (
-                    f'<a href="{r["url"]}" class="search-card" '
-                    f'target="_blank" rel="noopener">'
-                    f'<img class="search-thumb" '
-                    f'src="https://www.google.com/s2/favicons?domain={domain}&sz=64" '
-                    f'alt="" onerror="this.style.display=\'none\'">'
-                    f'<div class="search-info">'
-                    f'<div class="search-title">{r["title"]}</div>'
-                    f'<div class="search-link">'
-                    f'<img class="search-link-favicon" '
-                    f'src="https://www.google.com/s2/favicons?domain={domain}&sz=16" '
-                    f'alt="" onerror="this.style.display=\'none\'">'
-                    f'{r["url"][:80]}</div>'
-                    f'<div class="search-snippet">'
-                    f'{r.get("content", "")[:300]}</div>'
-                    f'</div></a>\n\n'
-                )
+                thumb_src = domain_images.get(domain, "")
+                favicon_src = f"https://www.google.com/s2/favicons?domain={domain}&sz=32"
+
+                if thumb_src:
+                    # Card WITH real thumbnail image
+                    html += (
+                        f'<a href="{r["url"]}" class="search-card" '
+                        f'target="_blank" rel="noopener">'
+                        f'<img class="search-thumb" '
+                        f'src="{thumb_src}" '
+                        f'alt="" loading="lazy" '
+                        f'onerror="this.src=\'{favicon_src}\';this.style.width=\'32px\';this.style.height=\'32px\';this.style.borderRadius=\'6px\';">'
+                        f'<div class="search-info">'
+                        f'<div class="search-title">{r["title"]}</div>'
+                        f'<div class="search-link">'
+                        f'<img class="search-link-favicon" '
+                        f'src="{favicon_src}" '
+                        f'alt="" onerror="this.style.display=\'none\'">'
+                        f'{domain}</div>'
+                        f'<div class="search-snippet">'
+                        f'{r.get("content", "")[:300]}</div>'
+                        f'</div></a>\n\n'
+                    )
+                else:
+                    # Card WITHOUT image — compact style
+                    html += (
+                        f'<a href="{r["url"]}" class="search-card compact" '
+                        f'target="_blank" rel="noopener">'
+                        f'<div class="search-info">'
+                        f'<div class="search-title">{r["title"]}</div>'
+                        f'<div class="search-link">'
+                        f'<img class="search-link-favicon" '
+                        f'src="{favicon_src}" '
+                        f'alt="" onerror="this.style.display=\'none\'">'
+                        f'{r["url"][:80]}</div>'
+                        f'<div class="search-snippet">'
+                        f'{r.get("content", "")[:300]}</div>'
+                        f'</div></a>\n\n'
+                    )
 
             return context, html
 
     except Exception as e:
         logger.error(f"Search failed: {e}")
         return "[Search failed]", ""
-
 
 async def stream_groq_chat(messages: list, model: str = None):
     use_model = model or GROQ_CHAT_MODEL
