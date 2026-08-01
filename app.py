@@ -46,6 +46,91 @@ REFRESH_THRESHOLD = 7 * 24 * 60 * 60
 
 GROQ_MAX_RETRIES = 3
 
+
+app = FastAPI(
+    title="HeloxAi Lite",
+    description="Text, Code, Math, Research, Image Generation & File Analysis Backend",
+    version="4.0.0"
+)
+
+# =========================
+# MODEL CONFIGURATION
+# =========================
+GROQ_CHAT_MODEL = "llama-3.3-70b-versatile"
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+GROQ_STT_MODEL = "whisper-large-v3"
+OPENAI_TTS_MODEL = "tts-1"
+OPENAI_IMAGE_MODEL = "gpt-image-1"
+
+# =========================
+# MODEL ROUTING
+# =========================
+MODEL_ROUTING = {
+    "helox": {
+        "chat": GROQ_CHAT_MODEL,
+        "vision": GROQ_VISION_MODEL,
+        "provider": "groq"
+    },
+    "chatgpt": {
+        "chat": "gpt-4o-mini",
+        "vision": "gpt-4o-mini",
+        "provider": "openai"
+    },
+    "chatz": {
+        "chat": GROQ_CHAT_MODEL,
+        "vision": GROQ_VISION_MODEL,
+        "provider": "groq"
+    },
+}
+
+# =========================
+# CORS CONFIGURATION
+# =========================
+service_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SERVICE_URL") or "https://heloxai2.onrender.com"
+frontend_url = os.getenv("FRONTEND_URL", service_url)
+
+allowed_origins = list({
+    frontend_url,
+    service_url,
+    "https://heloxai.xyz",
+    "https://www.heloxai.xyz",
+    "capacitor://localhost",
+})
+
+logger.info(f"CORS Allowed Origins: {allowed_origins}")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"]
+)
+
+# =========================
+# DATABASE & STATE
+# =========================
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+active_streams: Dict[str, asyncio.Task] = {}
+
+_session_cache: Dict[str, Dict[str, Any]] = {}
+_session_cache_ttl = 300
+
+_rate_limit_store: Dict[str, List[float]] = {}
+_conv_creation_locks: Dict[str, asyncio.Lock] = {}
+
+# FIX #1: Global lock to prevent duplicate user/session creation
+_new_user_lock = asyncio.Lock()
+_pending_new_user_id: Optional[str] = None
+_new_user_created_event = asyncio.Event()
+
+
+def _get_conv_lock(conv_id: str) -> asyncio.Lock:
+    if conv_id not in _conv_creation_locks:
+        _conv_creation_locks[conv_id] = asyncio.Lock()
+    return _conv_creation_locks[conv_id]
+
 # ══════════════════════════════════════════════
 # RATE LIMITING CONFIGURATION
 # ══════════════════════════════════════════════
@@ -172,91 +257,6 @@ async def rate_limit_middleware(request: Request, call_next):
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
-
-app = FastAPI(
-    title="HeloxAi Lite",
-    description="Text, Code, Math, Research, Image Generation & File Analysis Backend",
-    version="4.0.0"
-)
-
-# =========================
-# MODEL CONFIGURATION
-# =========================
-GROQ_CHAT_MODEL = "llama-3.3-70b-versatile"
-GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-GROQ_STT_MODEL = "whisper-large-v3"
-OPENAI_TTS_MODEL = "tts-1"
-OPENAI_IMAGE_MODEL = "gpt-image-1"
-
-# =========================
-# MODEL ROUTING
-# =========================
-MODEL_ROUTING = {
-    "helox": {
-        "chat": GROQ_CHAT_MODEL,
-        "vision": GROQ_VISION_MODEL,
-        "provider": "groq"
-    },
-    "chatgpt": {
-        "chat": "gpt-4o-mini",
-        "vision": "gpt-4o-mini",
-        "provider": "openai"
-    },
-    "chatz": {
-        "chat": GROQ_CHAT_MODEL,
-        "vision": GROQ_VISION_MODEL,
-        "provider": "groq"
-    },
-}
-
-# =========================
-# CORS CONFIGURATION
-# =========================
-service_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SERVICE_URL") or "https://heloxai2.onrender.com"
-frontend_url = os.getenv("FRONTEND_URL", service_url)
-
-allowed_origins = list({
-    frontend_url,
-    service_url,
-    "https://heloxai.xyz",
-    "https://www.heloxai.xyz",
-    "capacitor://localhost",
-})
-
-logger.info(f"CORS Allowed Origins: {allowed_origins}")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"]
-)
-
-# =========================
-# DATABASE & STATE
-# =========================
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-active_streams: Dict[str, asyncio.Task] = {}
-
-_session_cache: Dict[str, Dict[str, Any]] = {}
-_session_cache_ttl = 300
-
-_rate_limit_store: Dict[str, List[float]] = {}
-_conv_creation_locks: Dict[str, asyncio.Lock] = {}
-
-# FIX #1: Global lock to prevent duplicate user/session creation
-_new_user_lock = asyncio.Lock()
-_pending_new_user_id: Optional[str] = None
-_new_user_created_event = asyncio.Event()
-
-
-def _get_conv_lock(conv_id: str) -> asyncio.Lock:
-    if conv_id not in _conv_creation_locks:
-        _conv_creation_locks[conv_id] = asyncio.Lock()
-    return _conv_creation_locks[conv_id]
-
 
 
 # =========================
