@@ -258,35 +258,6 @@ def _get_conv_lock(conv_id: str) -> asyncio.Lock:
     return _conv_creation_locks[conv_id]
 
 
-# =========================
-# MIDDLEWARE: IP RATE LIMITER
-# =========================
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    if request.url.path == "/" or request.method == "OPTIONS":
-        return await call_next(request)
-
-    client_ip = request.client.host if request.client else "unknown"
-    now = time.time()
-
-    if client_ip not in _rate_limit_store:
-        _rate_limit_store[client_ip] = []
-
-    _rate_limit_store[client_ip] = [
-        t for t in _rate_limit_store[client_ip] if now - t < RATE_LIMIT_WINDOW
-    ]
-
-    if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_REQUESTS:
-        logger.warning(f"Rate limit hit for IP: {client_ip}")
-        return JSONResponse(
-            status_code=429,
-            content={"detail": "Too many requests. Please slow down."}
-        )
-
-    _rate_limit_store[client_ip].append(now)
-    response = await call_next(request)
-    return response
-
 
 # =========================
 # FILE TYPES
