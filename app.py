@@ -1488,6 +1488,88 @@ async def ask_universal(req: Request, res: Response, body: ChatRequest):
 
     # Image generation
         # Image generation
+
+    # ══════════════════════════════════════════════════════════
+# IMAGE GENERATION — STREAMING WITH LOADER EVENTS
+# ══════════════════════════════════════════════════════════
+
+elif intent == IntentCategory.IMAGE_GENERATION:
+    image_size = req_data.image_size or "1024x1024"
+    image_quality = req_data.image_quality or "medium"
+
+    async def image_gen_event_gen():
+        task = asyncio.current_task()
+        active_streams[user["id"]] = task
+        try:
+            yield sse({"type": "conversation_id", "conversation_id": conv_id})
+
+            # ── Tell frontend to show the loader IMMEDIATELY ──
+            yield sse({
+                "type": "image_generating",
+                "size": image_size
+            })
+
+            # Optional: progress update after a short delay
+            await asyncio.sleep(0.5)
+            yield sse({
+                "type": "image_progress",
+                "message": "Creating your image",
+                "sub": "Sending request to the model..."
+            })
+
+            # ── Actually generate the image (this takes 5-15s) ──
+            try:
+                b64_image = await generate_image_openai_sync(
+                    prompt=user_prompt,
+                    size=image_size,
+                    quality=image_quality
+                )
+            except Exception as img_err:
+                logger.error(f"Image generation failed: {img_err}")
+                # Remove the loader on the frontend by sending error
+                yield sse({
+                    "type": "image_progress",
+                    "message": "Generation failed",
+                    "sub": str(img_err)[:200]
+                })
+                # Fall back to a text response explaining the error
+                fallback = f"I wasn't able to generate that image. The model returned an error: `{str(img_err)[:300]}`\n\nYou can try:\n- Rephrasing your prompt\n- Using a different image size\n- Trying again in a moment"
+                yield sse({"type": "token", "text": fallback})
+                await save_message(user["id"], conv_id, "assistant", fallback)
+                yield sse({"type": "done"})
+                return
+
+            # ── Send the generated image to frontend ──
+            yield sse({
+                "type": "image_generated",
+                "data": b64_image,
+                "prompt": user_prompt,
+                "size": image_size
+            })
+
+            # Also save a text marker in the message history
+            saved_content = f"[Image Generated] Prompt: {user_prompt} | Size: {image_size}"
+            await save_message(user["id"], conv_id, "assistant", saved_content)
+            yield sse({"type": "done"})
+
+        except asyncio.CancelledError:
+            logger.info("Image generation stream cancelled by user")
+        except Exception as e:
+            logger.error(f"Image gen stream error: {e}")
+            yield sse({"type": "error", "message": str(e)})
+        finally:
+            active_streams.pop(user["id"], None)
+
+    return StreamingResponse(
+        image_gen_event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
     if intent.intent == IntentCategory.IMAGE_GENERATION and intent.confidence > 0.6:
         await save_message(user["id"], conv_id, "user", body.prompt)  # ← ADD THIS
         return await handle_image_generation(
