@@ -1469,146 +1469,197 @@ async def analyze_file_json(req: Request, res: Response):
 # =========================
 # Add this to your backend.py - Complete the ask/universal endpoint
 
+# =========================
+# UNIVERSAL ASK ENDPOINT
+# =========================
 @app.post("/ask/universal")
-async def ask_universal(req: Request, res: Response, body: ChatRequest):
-    """Universal endpoint for chat, search, image gen, and vision."""
-    if not body.prompt:
-        raise HTTPException(400, "Prompt is required")
+async def ask_universal(req: Request, res: Response, req_data: ChatRequest):
+    user = await get_user_with_auth(req, res, req_data.remember)
 
-    user = await get_user_with_auth(req, res, body.remember)
+    user_prompt = req_data.prompt.strip()
+    if not user_prompt:
+        raise HTTPException(400, "Prompt cannot be empty.")
+    if len(user_prompt) > MAX_TEXT_LENGTH:
+        raise HTTPException(400, f"Prompt too long. Max {MAX_TEXT_LENGTH} characters.")
 
     conv_id = await get_or_create_conversation(
         user_id=user["id"],
-        proposed_id=body.conversation_id,
-        title=body.prompt[:50]
+        proposed_id=req_data.conversation_id,
+        title=user_prompt[:50]
     )
+
+    await save_message(user["id"], conv_id, "user", user_prompt)
 
     # Detect intent
-    intent = _detector.detect(body.prompt)
+    intent_result = _detector.detect(user_prompt)
+    intent = intent_result.intent
 
-    # Image generation
-        # Image generation
-
-    # ══════════════════════════════════════════════════════════
-# IMAGE GENERATION — STREAMING WITH LOADER EVENTS
-# ══════════════════════════════════════════════════════════
-
-elif intent == IntentCategory.IMAGE_GENERATION:
-    image_size = req_data.image_size or "1024x1024"
-    image_quality = req_data.image_quality or "medium"
-
-    async def image_gen_event_gen():
-        task = asyncio.current_task()
-        active_streams[user["id"]] = task
-        try:
-            yield sse({"type": "conversation_id", "conversation_id": conv_id})
-
-            # ── Tell frontend to show the loader IMMEDIATELY ──
-            yield sse({
-                "type": "image_generating",
-                "size": image_size
-            })
-
-            # Optional: progress update after a short delay
-            await asyncio.sleep(0.5)
-            yield sse({
-                "type": "image_progress",
-                "message": "Creating your image",
-                "sub": "Sending request to the model..."
-            })
-
-            # ── Actually generate the image (this takes 5-15s) ──
-            try:
-                b64_image = await generate_image_openai_sync(
-                    prompt=user_prompt,
-                    size=image_size,
-                    quality=image_quality
-                )
-            except Exception as img_err:
-                logger.error(f"Image generation failed: {img_err}")
-                # Remove the loader on the frontend by sending error
-                yield sse({
-                    "type": "image_progress",
-                    "message": "Generation failed",
-                    "sub": str(img_err)[:200]
-                })
-                # Fall back to a text response explaining the error
-                fallback = f"I wasn't able to generate that image. The model returned an error: `{str(img_err)[:300]}`\n\nYou can try:\n- Rephrasing your prompt\n- Using a different image size\n- Trying again in a moment"
-                yield sse({"type": "token", "text": fallback})
-                await save_message(user["id"], conv_id, "assistant", fallback)
-                yield sse({"type": "done"})
-                return
-
-            # ── Send the generated image to frontend ──
-            yield sse({
-                "type": "image_generated",
-                "data": b64_image,
-                "prompt": user_prompt,
-                "size": image_size
-            })
-
-            # Also save a text marker in the message history
-            saved_content = f"[Image Generated] Prompt: {user_prompt} | Size: {image_size}"
-            await save_message(user["id"], conv_id, "assistant", saved_content)
-            yield sse({"type": "done"})
-
-        except asyncio.CancelledError:
-            logger.info("Image generation stream cancelled by user")
-        except Exception as e:
-            logger.error(f"Image gen stream error: {e}")
-            yield sse({"type": "error", "message": str(e)})
-        finally:
-            active_streams.pop(user["id"], None)
-
-    return StreamingResponse(
-        image_gen_event_gen(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-    )
-
-    if intent.intent == IntentCategory.IMAGE_GENERATION and intent.confidence > 0.6:
-        await save_message(user["id"], conv_id, "user", body.prompt)  # ← ADD THIS
-        return await handle_image_generation(
-            user=user,
-            conv_id=conv_id,
-            prompt=body.prompt,
-            size=body.image_size,
-            quality=body.image_quality,
-            stream=body.stream
-        )
-
-    # Build messages
-    messages = await build_chat_messages(
-        user_id=user["id"],
-        conv_id=conv_id,
-        prompt=body.prompt,
-        mode=body.mode,
-        model=body.model
-    )
-
-    # Get model config
-    model_config = MODEL_ROUTING.get(body.model, MODEL_ROUTING["helox"])
-    use_model = model_config["chat"]
+    # Resolve model based on user selection
+    model_key = req_data.model or "helox"
+    model_config = MODEL_ROUTING.get(model_key, MODEL_ROUTING["helox"])
+    chat_model = model_config["chat"]
+    vision_model = model_config["vision"]
     provider = model_config["provider"]
 
-    # Save user message
-    await save_message(user["id"], conv_id, "user", body.prompt)
+    # ── IMAGE GENERATION ──
+    if intent == IntentCategory.IMAGE_GENERATION:
+        image_size = req_data.image_size or "1024x1024"
+        image_quality = req_data.image_quality or "medium"
 
-    if body.stream:
+        async def image_gen_event_gen():
+            task = asyncio.current_task()
+            active_streams[user["id"]] = task
+            try:
+                yield sse({"type": "conversation_id", "conversation_id": conv_id})
+
+                # Tell frontend to show the loader IMMEDIATELY
+                yield sse({
+                    "type": "image_generating",
+                    "size": image_size
+                })
+
+                # Brief progress update
+                await asyncio.sleep(0.5)
+                yield sse({
+                    "type": "image_progress",
+                    "message": "Creating your image",
+                    "sub": "Sending request to the model..."
+                })
+
+                # Actually generate (takes 5-15s)
+                try:
+                    b64_image = await generate_image_openai_sync(
+                        prompt=user_prompt,
+                        size=image_size,
+                        quality=image_quality
+                    )
+                except Exception as img_err:
+                    logger.error(f"Image generation failed: {img_err}")
+                    yield sse({
+                        "type": "image_progress",
+                        "message": "Generation failed",
+                        "sub": str(img_err)[:200]
+                    })
+                    fallback = (
+                        f"I wasn't able to generate that image. "
+                        f"The model returned an error: `{str(img_err)[:300]}`\n\n"
+                        f"You can try:\n"
+                        f"- Rephrasing your prompt\n"
+                        f"- Using a different image size\n"
+                        f"- Trying again in a moment"
+                    )
+                    yield sse({"type": "token", "text": fallback})
+                    await save_message(user["id"], conv_id, "assistant", fallback)
+                    yield sse({"type": "done"})
+                    return
+
+                # Send image to frontend
+                yield sse({
+                    "type": "image_generated",
+                    "data": b64_image,
+                    "prompt": user_prompt,
+                    "size": image_size
+                })
+
+                saved_content = f"[Image Generated] Prompt: {user_prompt} | Size: {image_size}"
+                await save_message(user["id"], conv_id, "assistant", saved_content)
+                yield sse({"type": "done"})
+
+            except asyncio.CancelledError:
+                logger.info("Image generation stream cancelled by user")
+            except Exception as e:
+                logger.error(f"Image gen stream error: {e}")
+                yield sse({"type": "error", "message": str(e)})
+            finally:
+                active_streams.pop(user["id"], None)
+
         return StreamingResponse(
-            stream_chat_response(
-                user_id=user["id"],
-                conv_id=conv_id,
-                messages=messages,
-                model=use_model,
-                provider=provider,
-                mode=body.mode,
-                prompt=body.prompt
-            ),
+            image_gen_event_gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
+
+    # ── RESEARCH / WEB SEARCH ──
+    if intent == IntentCategory.RESEARCH:
+        search_context, search_html = await perform_web_search_formatted(user_prompt)
+        system_prompt = get_system_prompt(user_prompt)
+        messages = [
+            {"role": "system", "content": system_prompt},
+        ]
+        messages.extend(await get_history(conv_id, limit=4))
+        messages.append({
+            "role": "user",
+            "content": f"{user_prompt}\n\n--- Web Search Context ---\n{search_context}"
+        })
+
+        async def research_event_gen():
+            task = asyncio.current_task()
+            active_streams[user["id"]] = task
+            try:
+                yield sse({"type": "conversation_id", "conversation_id": conv_id})
+                if search_html:
+                    yield sse({"type": "search_results", "html": search_html})
+                full_text = ""
+                stream_fn = stream_groq_chat if provider == "groq" else stream_openai_chat
+                use_model = chat_model if provider == "groq" else chat_model
+                async for token in stream_fn(messages, model=use_model):
+                    if task.cancelled():
+                        break
+                    full_text += token
+                    yield sse({"type": "token", "text": token})
+                await save_message(user["id"], conv_id, "assistant", full_text)
+                yield sse({"type": "done"})
+            except Exception as e:
+                logger.error(f"Research stream error: {e}")
+                yield sse({"type": "error", "message": str(e)})
+            finally:
+                active_streams.pop(user["id"], None)
+
+        return StreamingResponse(
+            research_event_gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
+
+    # ── GENERAL CHAT / CODE / MATH (DEFAULT) ──
+    system_prompt = get_system_prompt(user_prompt)
+    messages = [
+        {"role": "system", "content": system_prompt},
+    ]
+    messages.extend(await get_history(conv_id, limit=4))
+    messages.append({"role": "user", "content": user_prompt})
+
+    if req_data.stream:
+        async def chat_event_gen():
+            task = asyncio.current_task()
+            active_streams[user["id"]] = task
+            try:
+                yield sse({"type": "conversation_id", "conversation_id": conv_id})
+                full_text = ""
+                stream_fn = stream_groq_chat if provider == "groq" else stream_openai_chat
+                async for token in stream_fn(messages, model=chat_model):
+                    if task.cancelled():
+                        break
+                    full_text += token
+                    yield sse({"type": "token", "text": token})
+                await save_message(user["id"], conv_id, "assistant", full_text)
+                yield sse({"type": "done"})
+            except Exception as e:
+                logger.error(f"Chat stream error: {e}")
+                yield sse({"type": "error", "message": str(e)})
+            finally:
+                active_streams.pop(user["id"], None)
+
+        return StreamingResponse(
+            chat_event_gen(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1617,12 +1668,16 @@ elif intent == IntentCategory.IMAGE_GENERATION:
             }
         )
     else:
-        if provider == "openai":
-            reply = await openai_chat_sync(messages, model=use_model)
-        else:
-            reply = await groq_chat_sync(messages, model=use_model)
-        await save_message(user["id"], conv_id, "assistant", reply)
-        return {"reply": reply, "conversation_id": conv_id}
+        try:
+            if provider == "groq":
+                reply = await groq_chat_sync(messages, model=chat_model)
+            else:
+                reply = await openai_chat_sync(messages, model=chat_model)
+            await save_message(user["id"], conv_id, "assistant", reply)
+            return {"reply": reply, "conversation_id": conv_id}
+        except Exception as e:
+            logger.error(f"Chat sync error: {e}")
+            raise HTTPException(500, str(e))
 
 
 async def handle_image_generation(
