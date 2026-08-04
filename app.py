@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 import base64
+import io
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -20,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from supabase import create_client
+from PIL import Image
 
 # =========================
 # CONFIG & LOGGING
@@ -50,7 +52,7 @@ GROQ_MAX_RETRIES = 3
 app = FastAPI(
     title="HeloxAi Lite",
     description="Text, Code, Math, Research, Image Generation & File Analysis Backend",
-    version="4.0.0"
+    version="4.1.0"
 )
 
 # =========================
@@ -120,7 +122,6 @@ _session_cache_ttl = 300
 _rate_limit_store: Dict[str, List[float]] = {}
 _conv_creation_locks: Dict[str, asyncio.Lock] = {}
 
-# FIX #1: Global lock to prevent duplicate user/session creation
 _new_user_lock = asyncio.Lock()
 _pending_new_user_id: Optional[str] = None
 _new_user_created_event = asyncio.Event()
@@ -135,11 +136,9 @@ def _get_conv_lock(conv_id: str) -> asyncio.Lock:
 # RATE LIMITING CONFIGURATION
 # ══════════════════════════════════════════════
 
-# Global IP limits
-IP_RATE_LIMIT = 30          # requests
-IP_RATE_WINDOW = 60         # seconds
+IP_RATE_LIMIT = 30
+IP_RATE_WINDOW = 60
 
-# Per-endpoint overrides (stricter for expensive ops)
 ENDPOINT_LIMITS = {
     "/ask/universal":       {"limit": 20, "window": 60},
     "/tts":                 {"limit": 10, "window": 60},
@@ -147,16 +146,13 @@ ENDPOINT_LIMITS = {
     "/analysis":            {"limit": 15, "window": 60},
 }
 
-# Cleanup stale entries every N seconds
 _RATE_CLEANUP_INTERVAL = 300
 _last_rate_cleanup = 0
 
-# Store: { key: [timestamps] }
 _rate_store: Dict[str, List[float]] = {}
 
 
 def _get_rate_key(client_ip: str, path: str) -> str:
-    """Use IP alone for global, IP+path for per-endpoint."""
     for ep in ENDPOINT_LIMITS:
         if path.startswith(ep):
             return f"{client_ip}:{ep}"
@@ -164,7 +160,6 @@ def _get_rate_key(client_ip: str, path: str) -> str:
 
 
 def _get_limits_for_key(key: str) -> Tuple[int, int]:
-    """Return (limit, window) for a given rate key."""
     for ep, cfg in ENDPOINT_LIMITS.items():
         if key.endswith(ep):
             return cfg["limit"], cfg["window"]
@@ -172,7 +167,6 @@ def _get_limits_for_key(key: str) -> Tuple[int, int]:
 
 
 def _cleanup_rate_store(now: float):
-    """Prune entries older than their window to prevent memory leaks."""
     global _last_rate_cleanup
     if now - _last_rate_cleanup < _RATE_CLEANUP_INTERVAL:
         return
@@ -181,7 +175,6 @@ def _cleanup_rate_store(now: float):
     stale_keys = []
     for key, timestamps in _rate_store.items():
         _, window = _get_limits_for_key(key)
-        # Keep only recent timestamps
         filtered = [t for t in timestamps if now - t < window]
         if filtered:
             _rate_store[key] = filtered
@@ -197,14 +190,12 @@ def _cleanup_rate_store(now: float):
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    # Skip health checks and CORS preflight
     if request.url.path == "/" or request.method == "OPTIONS":
         return await call_next(request)
 
     client_ip = request.client.host if request.client else "unknown"
     now = time.time()
 
-    # Periodic cleanup
     _cleanup_rate_store(now)
 
     key = _get_rate_key(client_ip, request.url.path)
@@ -213,18 +204,13 @@ async def rate_limit_middleware(request: Request, call_next):
     if key not in _rate_store:
         _rate_store[key] = []
 
-    # Sliding window: keep only timestamps within the window
     _rate_store[key] = [t for t in _rate_store[key] if now - t < window]
-
     current_count = len(_rate_store[key])
 
     if current_count >= limit:
-        # Calculate when the oldest request expires → reset time
         oldest = _rate_store[key][0]
         reset_at = int(oldest + window)
-        logger.warning(
-            f"Rate limit hit: {key} ({current_count}/{limit})"
-        )
+        logger.warning(f"Rate limit hit: {key} ({current_count}/{limit})")
         return JSONResponse(
             status_code=429,
             content={
@@ -241,14 +227,12 @@ async def rate_limit_middleware(request: Request, call_next):
             }
         )
 
-    # Record this request
     _rate_store[key].append(now)
     remaining = limit - current_count - 1
     reset_at = int(_rate_store[key][0] + window)
 
     response = await call_next(request)
 
-    # Attach rate limit headers to all responses
     response.headers["X-RateLimit-Limit"] = str(limit)
     response.headers["X-RateLimit-Remaining"] = str(max(0, remaining))
     response.headers["X-RateLimit-Reset"] = str(reset_at)
@@ -337,7 +321,7 @@ def _is_image_mime(mime: str) -> bool:
 
 
 # =========================
-# AUTH SYSTEM (FIXED)
+# AUTH SYSTEM
 # =========================
 PRIMARY_COOKIE = "HeloxAI_Session"
 SESSION_TOKEN_COOKIE = "HeloxAI_Token"
@@ -668,38 +652,26 @@ async def _execute_supabase_with_retry(query_builder):
 
 
 async def get_user(req: Request, res: Response, remember: bool = True) -> Dict[str, Any]:
-    """
-    Get or create a user session from cookies.
-    Uses a global lock to prevent duplicate user/session creation
-    when multiple requests arrive simultaneously from the same client.
-    """
     global _pending_new_user_id, _new_user_created_event
 
     user_id = req.cookies.get(PRIMARY_COOKIE)
     token = req.cookies.get(SESSION_TOKEN_COOKIE)
     expiry = req.cookies.get(SESSION_EXPIRY_COOKIE)
 
-    # --- Fast path: valid existing session ---
     if user_id and token:
         if is_session_expired(expiry or "0"):
             clear_session_cookies(res)
         elif await validate_session_token(user_id, token):
             return {"id": user_id, "session_valid": True}
 
-    # --- Slow path: create new user/session ---
     async with _new_user_lock:
         if _pending_new_user_id is not None:
-            # Another request is already creating a user — wait for it
             logger.debug("Waiting for concurrent user creation to complete...")
             await _new_user_created_event.wait()
             _new_user_created_event.clear()
 
-            # After wait, re-check: if cookies were set by the winning request
-            # they won't appear on THIS request object, but we can check the DB
-            # via the pending user id
             if _pending_new_user_id != "__failed__":
                 candidate_id = _pending_new_user_id
-                # Validate the session that was just created
                 result = await asyncio.to_thread(
                     supabase.table("user_sessions")
                     .select("token")
@@ -715,14 +687,11 @@ async def get_user(req: Request, res: Response, remember: bool = True) -> Dict[s
                     _session_cache[candidate_id] = {"token": winning_token, "time": time.time()}
                     _pending_new_user_id = None
                     return {"id": candidate_id, "session_valid": True}
-            # Creation failed or invalid — fall through to create our own
             _pending_new_user_id = None
 
-        # Mark that we are creating a user
         _pending_new_user_id = "creating"
         _new_user_created_event.clear()
 
-    # --- Actually create the user (outside the lock to not block reads) ---
     try:
         new_id = str(uuid.uuid4())
         new_token = await create_user_session(new_id, remember)
@@ -733,7 +702,6 @@ async def get_user(req: Request, res: Response, remember: bool = True) -> Dict[s
 
         set_session_cookies(res, new_id, new_token, remember)
 
-        # Signal waiting requests with the new user id
         _pending_new_user_id = new_id
         _new_user_created_event.set()
 
@@ -750,15 +718,10 @@ async def get_user(req: Request, res: Response, remember: bool = True) -> Dict[s
 
 
 async def get_user_with_auth(req: Request, res: Response, remember: bool = True) -> Dict[str, Any]:
-    """
-    Extended get_user that also checks Authorization header.
-    FIX #2: Skip anon key to avoid unnecessary 403s.
-    """
     auth_header = req.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header.replace("Bearer ", "")
 
-        # Skip anon key — it will always 403 and we'll fall back anyway
         if SUPABASE_ANON_KEY and token == SUPABASE_ANON_KEY:
             return await get_user(req, res, remember)
 
@@ -879,14 +842,12 @@ async def perform_web_search_formatted(query: str) -> Tuple[str, str]:
             if not results:
                 return "[No search results found]", ""
 
-            # Build plain context for AI
             context = ""
             if data.get("answer"):
                 context += f"Answer: {data['answer']}\n"
             for i, r in enumerate(results):
                 context += f"[{i+1}] {r['title']}: {r['content']}\nURL: {r['url']}\n\n"
 
-            # Build image lookup: map domain → first image for that domain
             domain_images = {}
             for img_url in raw_images[:20]:
                 try:
@@ -897,7 +858,6 @@ async def perform_web_search_formatted(query: str) -> Tuple[str, str]:
                 except Exception:
                     pass
 
-            # ── Sources bar ──
             html = '<div class="search-sources-bar">\n'
             html += '<i class="fa-solid fa-globe"></i> Sources:\n'
             for r in results[:5]:
@@ -912,14 +872,12 @@ async def perform_web_search_formatted(query: str) -> Tuple[str, str]:
                 )
             html += '</div>\n\n'
 
-            # ── Search result cards with real images ──
             for i, r in enumerate(results[:4]):
                 domain = urlparse(r["url"]).hostname or ""
                 thumb_src = domain_images.get(domain, "")
                 favicon_src = f"https://www.google.com/s2/favicons?domain={domain}&sz=32"
 
                 if thumb_src:
-                    # Card WITH real thumbnail image
                     html += (
                         f'<a href="{r["url"]}" class="search-card" '
                         f'target="_blank" rel="noopener">'
@@ -939,7 +897,6 @@ async def perform_web_search_formatted(query: str) -> Tuple[str, str]:
                         f'</div></a>\n\n'
                     )
                 else:
-                    # Card WITHOUT image — compact style
                     html += (
                         f'<a href="{r["url"]}" class="search-card compact" '
                         f'target="_blank" rel="noopener">'
@@ -960,6 +917,7 @@ async def perform_web_search_formatted(query: str) -> Tuple[str, str]:
     except Exception as e:
         logger.error(f"Search failed: {e}")
         return "[Search failed]", ""
+
 
 async def stream_groq_chat(messages: list, model: str = None):
     use_model = model or GROQ_CHAT_MODEL
@@ -1019,7 +977,6 @@ async def stream_groq_chat(messages: list, model: str = None):
 
 
 async def stream_openai_chat(messages: list, model: str = "gpt-4o-mini"):
-    """Stream from OpenAI API — mirrors stream_groq_chat interface."""
     if not OPENAI_API_KEY:
         yield "[OpenAI API not configured]"
         return
@@ -1060,7 +1017,6 @@ async def stream_openai_chat(messages: list, model: str = "gpt-4o-mini"):
 
 
 async def groq_chat_sync(messages: list, model: str = None, max_tokens: int = 4096) -> str:
-    """Non-streaming Groq chat completion with retry."""
     use_model = model or GROQ_CHAT_MODEL
     attempt = 0
     while attempt < GROQ_MAX_RETRIES:
@@ -1086,7 +1042,6 @@ async def groq_chat_sync(messages: list, model: str = None, max_tokens: int = 40
 
 
 async def openai_chat_sync(messages: list, model: str = "gpt-4o-mini", max_tokens: int = 4096) -> str:
-    """Non-streaming OpenAI chat completion."""
     if not OPENAI_API_KEY:
         raise Exception("OpenAI API not configured")
 
@@ -1147,6 +1102,67 @@ async def generate_image_openai_sync(
                     img_resp.raise_for_status()
                     return base64.b64encode(img_resp.content).decode()
         raise Exception("No image data in response")
+
+
+# ════════════════════════════════════════════════════════════════
+# PROGRESSIVE IMAGE STREAMING
+# ════════════════════════════════════════════════════════════════
+
+def generate_progressive_frames(image_b64: str, steps: int = 8) -> list:
+    """
+    Convert a base64 image into multiple JPEG quality levels
+    for progressive streaming to the frontend.
+
+    Each frame is a COMPLETE valid JPEG that the browser can
+    render instantly. Quality increases with each frame,
+    creating the "image sharpening over time" effect.
+
+    Args:
+        image_b64: Base64-encoded image (PNG from OpenAI, or JPEG)
+        steps: Number of progressive quality levels (default 8)
+
+    Returns:
+        List of dicts: [{"progress": int, "data": str}, ...]
+    """
+    try:
+        image_bytes = base64.b64decode(image_b64)
+        img = Image.open(io.BytesIO(image_bytes))
+
+        if img.mode in ('RGBA', 'LA', 'P'):
+            bg = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            if img.mode in ('RGBA', 'LA'):
+                bg.paste(img, mask=img.split()[-1])
+            img = bg
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        frames = []
+        quality_curve = [3, 8, 15, 28, 45, 65, 82, 95][:steps]
+
+        for i, q in enumerate(quality_curve):
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=q, progressive=True, optimize=True)
+            frame_b64 = base64.b64encode(buf.getvalue()).decode()
+            frames.append({
+                "progress": int((i + 1) / len(quality_curve) * 100),
+                "data": frame_b64
+            })
+            buf.close()
+
+        logger.info(
+            f"Progressive frames generated: {len(frames)} levels, "
+            f"original={len(image_b64)} chars, "
+            f"first_frame={len(frames[0]['data'])} chars, "
+            f"last_frame={len(frames[-1]['data'])} chars"
+        )
+
+        return frames
+
+    except Exception as e:
+        logger.error(f"Progressive frame generation failed: {e}")
+        return [{"progress": 100, "data": image_b64}]
 
 
 # =========================
@@ -1211,6 +1227,165 @@ Provide a thorough analysis: summary, key points, structure, issues, and recomme
     ]
 
 
+# ════════════════════════════════════════════════════════════════
+# STREAMING GENERATORS
+#
+# NOTE: These are async generators (use `yield`). Python does NOT
+# allow `return <value>` in async generators — only bare `return`
+# to stop iteration. To pass data back to the caller, we use a
+# mutable `result` dict that the generator writes to.
+# ════════════════════════════════════════════════════════════════
+
+async def _stream_image_generation(
+    prompt: str,
+    size: str,
+    quality: str,
+    result: dict,
+):
+    """
+    Handle the full image generation pipeline with progressive streaming.
+
+    Yields SSE event strings.
+    Writes the response text to result["text"] for DB saving.
+    """
+    yield sse({"type": "image_generating"})
+
+    try:
+        image_b64 = await generate_image_openai_sync(
+            prompt, size=size, quality=quality
+        )
+
+        frames = generate_progressive_frames(image_b64, steps=8)
+
+        for frame in frames:
+            yield sse({
+                "type": "image_progress",
+                "progress": frame["progress"],
+                "data": frame["data"]
+            })
+            await asyncio.sleep(0.08)
+
+        yield sse({
+            "type": "image_generated",
+            "data": image_b64,
+            "size": size,
+            "quality": quality
+        })
+
+        result["text"] = f"[Generated image: {size}, {quality} quality]"
+
+    except Exception as e:
+        error_str = str(e)
+        logger.error(f"Image generation stream error: {error_str}")
+        yield sse({
+            "type": "image_error",
+            "error": error_str
+        })
+        result["text"] = f"[Image generation failed: {error_str}]"
+
+    return
+
+
+async def _stream_chat_response(
+    prompt: str,
+    conversation_id: str,
+    model_key: str,
+    mode: Optional[str],
+    user_id: str,
+    result: dict,
+):
+    """
+    Handle text chat with optional web search, streaming tokens.
+
+    Yields SSE event strings.
+    Writes the full response text to result["text"] for DB saving.
+    """
+    model_config = MODEL_ROUTING.get(model_key, MODEL_ROUTING["helox"])
+    chat_model = model_config["chat"]
+    provider = model_config["provider"]
+
+    should_search = False
+    search_context = ""
+    search_html = ""
+
+    intent = _detector.detect(prompt)
+    if intent.intent == IntentCategory.RESEARCH:
+        should_search = True
+    elif mode in ("research", "finance", "web"):
+        should_search = True
+    else:
+        time_keywords = [
+            'today', 'now', 'current', 'latest', 'recent',
+            '2024', '2025', 'price', 'stock', 'news',
+            'weather', 'score', 'update', 'happening'
+        ]
+        if any(kw in prompt.lower() for kw in time_keywords):
+            should_search = True
+
+    if should_search and TAVILY_API_KEY:
+        try:
+            search_context, search_html = await perform_web_search_formatted(prompt)
+            if search_html:
+                yield sse({
+                    "type": "search_results",
+                    "html": search_html
+                })
+        except Exception as e:
+            logger.error(f"Search failed in chat stream: {e}")
+
+    system_prompt = get_system_prompt(prompt)
+    if mode == "finance":
+        system_prompt = FINANCE_SYSTEM_PROMPT
+
+    messages = [{"role": "system", "content": system_prompt}]
+
+    try:
+        history = await get_history(conversation_id, limit=6)
+        messages.extend(history)
+    except Exception as e:
+        logger.warning(f"Failed to load history: {e}")
+
+    if (search_context
+            and search_context != "[Search API Key missing]"
+            and search_context != "[No search results found]"
+            and search_context != "[Search failed]"):
+        user_content = f"""Using these search results as context:
+
+{search_context}
+
+User question: {prompt}
+
+Provide a comprehensive answer based on the search results above. Cite sources as [1], [2] etc."""
+    else:
+        user_content = prompt
+
+    messages.append({"role": "user", "content": user_content})
+
+    full_response = ""
+    use_model = chat_model
+    stream_fn = stream_groq_chat if provider == "groq" else stream_openai_chat
+
+    try:
+        async for delta in stream_fn(messages, model=use_model):
+            full_response += delta
+            yield sse({
+                "type": "text_delta",
+                "content": delta
+            })
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Chat stream error: {error_msg}")
+        if not full_response:
+            full_response = f"[Error: {error_msg}]"
+            yield sse({
+                "type": "text_delta",
+                "content": f"\n\n*Error occurred: {error_msg}*"
+            })
+
+    result["text"] = full_response
+    return
+
+
 # =========================
 # ENDPOINTS
 # =========================
@@ -1219,7 +1394,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Lite",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "models": {
             "chat": GROQ_CHAT_MODEL,
             "vision": GROQ_VISION_MODEL,
@@ -1230,13 +1405,13 @@ async def root():
         "features": [
             "chat", "code", "math", "web_search", "tts", "stt",
             "image_generation", "image_analysis", "code_analysis",
-            "document_analysis", "finance", "model_routing", "mode_routing"
+            "document_analysis", "finance", "model_routing", "mode_routing",
+            "progressive_image_streaming"
         ],
         "endpoints": {
             "chat": "POST /ask/universal",
             "new_chat": "POST /newchat",
             "analysis": "POST /analysis",
-            "analysis_json": "POST /analysis/json",
             "delete_chat": "DELETE /chats/{chat_id}",
             "list_chats": "GET /chats",
             "messages": "GET /chat/{conversation_id}/messages",
@@ -1254,7 +1429,6 @@ async def root():
 # =========================
 @app.get("/user/plan")
 async def get_user_plan(req: Request):
-    """Fallback plan endpoint when Supabase RLS fails on the client."""
     auth_header = req.headers.get("authorization", "")
 
     if not auth_header.startswith("Bearer "):
@@ -1378,295 +1552,55 @@ async def analyze_file(
     else:
         raise HTTPException(400, "Either 'file' or 'image_base64' must be provided.")
 
-    display_prompt = prompt or f"Analysis of {file_filename}"
     conv_id = await get_or_create_conversation(
-        user_id=user["id"], proposed_id=conversation_id, title=display_prompt
+        user["id"],
+        conversation_id,
+        f"Analysis: {file_filename}" if file_filename else "Image Analysis"
     )
 
-    if file_category == FileCategory.IMAGE:
-        user_msg = (
-            f"[Image Analysis] "
-            f"{file_filename if file and file.filename else 'Base64 image'}"
-            + (f"\n{prompt}" if prompt else "")
-        )
-    else:
-        language = get_language_from_extension(file_filename)
-        user_msg = (
-            f"[{file_category.value.title()} Analysis] "
-            f"{file_filename} ({language})"
-            + (f"\n{prompt}" if prompt else "")
-        )
-    await save_message(user["id"], conv_id, "user", user_msg)
+    user_msg_content = prompt or f"[Uploaded {file_filename} for analysis]"
+    await save_message(user["id"], conv_id, "user", user_msg_content)
 
     if file_category == FileCategory.IMAGE:
-        if not GROQ_API_KEY:
-            raise HTTPException(500, "Groq API Key required for image analysis")
-        messages = _build_image_analysis_messages(image_data_b64, image_mime_type, prompt)
-        use_model = GROQ_VISION_MODEL
-    elif file_category == FileCategory.CODE:
-        language = get_language_from_extension(file_filename)
-        messages = _build_code_analysis_messages(
-            file_text_content, file_filename, language, prompt
+        analysis_messages = _build_image_analysis_messages(
+            image_data_b64, image_mime_type, prompt
         )
-        use_model = GROQ_CHAT_MODEL
     else:
-        messages = _build_document_analysis_messages(
-            file_text_content, file_filename, prompt
-        )
-        use_model = GROQ_CHAT_MODEL
+        language = get_language_from_extension(file_filename)
+        if file_category == FileCategory.CODE:
+            analysis_messages = _build_code_analysis_messages(
+                file_text_content, file_filename, language, prompt
+            )
+        else:
+            analysis_messages = _build_document_analysis_messages(
+                file_text_content, file_filename, prompt
+            )
 
     if stream:
-        async def analysis_event_gen():
-            task = asyncio.current_task()
-            active_streams[user["id"]] = task
+        async def analysis_stream():
+            full_response = ""
             try:
-                yield sse({"type": "conversation_id", "conversation_id": conv_id})
-                full_text = ""
-                async for token in stream_groq_chat(messages, model=use_model):
-                    if task.cancelled():
-                        break
-                    full_text += token
-                    yield sse({"type": "token", "text": token})
-                await save_message(user["id"], conv_id, "assistant", full_text)
-                yield sse({"type": "done"})
+                async for delta in stream_groq_chat(
+                    analysis_messages, model=GROQ_VISION_MODEL
+                ):
+                    full_response += delta
+                    yield sse({"type": "text_delta", "content": delta})
             except Exception as e:
-                logger.error(f"Analysis stream error: {e}")
-                yield sse({"type": "error", "message": str(e)})
-            finally:
-                active_streams.pop(user["id"], None)
-        return StreamingResponse(analysis_event_gen(), media_type="text/event-stream")
-    else:
-        try:
-            reply = await groq_chat_sync(messages, model=use_model)
-            await save_message(user["id"], conv_id, "assistant", reply)
-            return {
-                "reply": reply,
-                "conversation_id": conv_id,
-                "analysis_type": file_category.value
-            }
-        except Exception as e:
-            logger.error(f"Analysis error: {e}")
-            raise HTTPException(500, str(e))
+                error_str = str(e)
+                logger.error(f"Analysis stream error: {error_str}")
+                if not full_response:
+                    full_response = f"[Analysis error: {error_str}]"
+                    yield sse({"type": "text_delta", "content": f"*Error: {error_str}*"})
 
-
-# =========================
-# ANALYSIS ENDPOINT (JSON BODY)
-# =========================
-@app.post("/analysis/json")
-async def analyze_file_json(req: Request, res: Response):
-    body = await req.json()
-
-    image_b64 = body.get("image_base64")
-    text_content = body.get("content")
-    filename = body.get("filename", "unknown")
-    prompt = body.get("prompt")
-    conv_id_proposed = body.get("conversation_id")
-    do_stream = body.get("stream", True)
-    remember = body.get("remember", True)
-    analysis_type_str = body.get("analysis_type", "auto")
-
-    user = await get_user_with_auth(req, res, remember)
-
-    file_category = FileCategory.UNKNOWN
-    image_data_b64 = None
-    image_mime_type = body.get("image_mime", "image/png")
-    file_text = None
-
-    if image_b64:
-        clean_b64 = image_b64
-        if "," in image_b64:
-            clean_b64 = image_b64.split(",", 1)[1]
-        image_data_b64 = clean_b64.strip()
-        file_category = (
-            FileCategory.IMAGE
-            if analysis_type_str in ("auto", "image")
-            else FileCategory(analysis_type_str)
-        )
-    elif text_content:
-        file_text = text_content[:MAX_TEXT_LENGTH]
-        if analysis_type_str and analysis_type_str != "auto":
             try:
-                file_category = FileCategory(analysis_type_str)
-            except ValueError:
-                file_category = get_file_category(filename)
-        else:
-            file_category = get_file_category(filename)
-    else:
-        raise HTTPException(400, "Either 'image_base64' or 'content' must be provided.")
-
-    display_prompt = prompt or f"Analysis of {filename}"
-    conv_id = await get_or_create_conversation(
-        user_id=user["id"], proposed_id=conv_id_proposed, title=display_prompt
-    )
-
-    if file_category == FileCategory.IMAGE:
-        user_msg = f"[Image Analysis] {filename}" + (f"\n{prompt}" if prompt else "")
-    else:
-        language = get_language_from_extension(filename)
-        user_msg = (
-            f"[{file_category.value.title()} Analysis] {filename} ({language})"
-            + (f"\n{prompt}" if prompt else "")
-        )
-    await save_message(user["id"], conv_id, "user", user_msg)
-
-    if file_category == FileCategory.IMAGE:
-        if not GROQ_API_KEY:
-            raise HTTPException(500, "Groq API Key required for image analysis")
-        messages = _build_image_analysis_messages(image_data_b64, image_mime_type, prompt)
-        use_model = GROQ_VISION_MODEL
-    elif file_category == FileCategory.CODE:
-        language = get_language_from_extension(filename)
-        messages = _build_code_analysis_messages(file_text, filename, language, prompt)
-        use_model = GROQ_CHAT_MODEL
-    else:
-        messages = _build_document_analysis_messages(file_text, filename, prompt)
-        use_model = GROQ_CHAT_MODEL
-
-    if do_stream:
-        async def analysis_json_event_gen():
-            task = asyncio.current_task()
-            active_streams[user["id"]] = task
-            try:
-                yield sse({"type": "conversation_id", "conversation_id": conv_id})
-                full_text = ""
-                async for token in stream_groq_chat(messages, model=use_model):
-                    if task.cancelled():
-                        break
-                    full_text += token
-                    yield sse({"type": "token", "text": token})
-                await save_message(user["id"], conv_id, "assistant", full_text)
-                yield sse({"type": "done"})
+                await save_message(user["id"], conv_id, "assistant", full_response)
             except Exception as e:
-                logger.error(f"Analysis JSON stream error: {e}")
-                yield sse({"type": "error", "message": str(e)})
-            finally:
-                active_streams.pop(user["id"], None)
-        return StreamingResponse(analysis_json_event_gen(), media_type="text/event-stream")
-    else:
-        try:
-            reply = await groq_chat_sync(messages, model=use_model)
-            await save_message(user["id"], conv_id, "assistant", reply)
-            return {
-                "reply": reply,
-                "conversation_id": conv_id,
-                "analysis_type": file_category.value
-            }
-        except Exception as e:
-            logger.error(f"Analysis JSON error: {e}")
-            raise HTTPException(500, str(e))
+                logger.error(f"Failed to save analysis response: {e}")
 
-
-# =========================
-# UNIVERSAL CHAT ENDPOINT (COMPLETE)
-# =========================
-# Add this to your backend.py - Complete the ask/universal endpoint
-
-# =========================
-# UNIVERSAL ASK ENDPOINT
-# =========================
-@app.post("/ask/universal")
-async def ask_universal(req: Request, res: Response, req_data: ChatRequest):
-    user = await get_user_with_auth(req, res, req_data.remember)
-
-    user_prompt = req_data.prompt.strip()
-    if not user_prompt:
-        raise HTTPException(400, "Prompt cannot be empty.")
-    if len(user_prompt) > MAX_TEXT_LENGTH:
-        raise HTTPException(400, f"Prompt too long. Max {MAX_TEXT_LENGTH} characters.")
-
-    conv_id = await get_or_create_conversation(
-        user_id=user["id"],
-        proposed_id=req_data.conversation_id,
-        title=user_prompt[:50]
-    )
-
-    await save_message(user["id"], conv_id, "user", user_prompt)
-
-    # Detect intent
-    intent_result = _detector.detect(user_prompt)
-    intent = intent_result.intent
-
-    # Resolve model based on user selection
-    model_key = req_data.model or "helox"
-    model_config = MODEL_ROUTING.get(model_key, MODEL_ROUTING["helox"])
-    chat_model = model_config["chat"]
-    vision_model = model_config["vision"]
-    provider = model_config["provider"]
-
-    # ── IMAGE GENERATION ──
-    if intent == IntentCategory.IMAGE_GENERATION:
-        image_size = req_data.image_size or "1024x1024"
-        image_quality = req_data.image_quality or "medium"
-
-        async def image_gen_event_gen():
-            task = asyncio.current_task()
-            active_streams[user["id"]] = task
-            try:
-                yield sse({"type": "conversation_id", "conversation_id": conv_id})
-
-                # Tell frontend to show the loader IMMEDIATELY
-                yield sse({
-                    "type": "image_generating",
-                    "size": image_size
-                })
-
-                # Brief progress update
-                await asyncio.sleep(0.5)
-                yield sse({
-                    "type": "image_progress",
-                    "message": "Creating your image",
-                    "sub": "Sending request to the model..."
-                })
-
-                # Actually generate (takes 5-15s)
-                try:
-                    b64_image = await generate_image_openai_sync(
-                        prompt=user_prompt,
-                        size=image_size,
-                        quality=image_quality
-                    )
-                except Exception as img_err:
-                    logger.error(f"Image generation failed: {img_err}")
-                    yield sse({
-                        "type": "image_progress",
-                        "message": "Generation failed",
-                        "sub": str(img_err)[:200]
-                    })
-                    fallback = (
-                        f"I wasn't able to generate that image. "
-                        f"The model returned an error: `{str(img_err)[:300]}`\n\n"
-                        f"You can try:\n"
-                        f"- Rephrasing your prompt\n"
-                        f"- Using a different image size\n"
-                        f"- Trying again in a moment"
-                    )
-                    yield sse({"type": "token", "text": fallback})
-                    await save_message(user["id"], conv_id, "assistant", fallback)
-                    yield sse({"type": "done"})
-                    return
-
-                # Send image to frontend
-                yield sse({
-                    "type": "image_generated",
-                    "data": b64_image,
-                    "prompt": user_prompt,
-                    "size": image_size
-                })
-
-                saved_content = f"[Image Generated] Prompt: {user_prompt} | Size: {image_size}"
-                await save_message(user["id"], conv_id, "assistant", saved_content)
-                yield sse({"type": "done"})
-
-            except asyncio.CancelledError:
-                logger.info("Image generation stream cancelled by user")
-            except Exception as e:
-                logger.error(f"Image gen stream error: {e}")
-                yield sse({"type": "error", "message": str(e)})
-            finally:
-                active_streams.pop(user["id"], None)
+            yield sse({"type": "done", "conversation_id": conv_id})
 
         return StreamingResponse(
-            image_gen_event_gen(),
+            analysis_stream(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1674,460 +1608,267 @@ async def ask_universal(req: Request, res: Response, req_data: ChatRequest):
                 "X-Accel-Buffering": "no",
             }
         )
+    else:
+        try:
+            response_text = await groq_chat_sync(
+                analysis_messages, model=GROQ_VISION_MODEL
+            )
+        except Exception as e:
+            response_text = f"[Analysis error: {str(e)}]"
 
-    # ── RESEARCH / WEB SEARCH ──
-    if intent == IntentCategory.RESEARCH:
-        search_context, search_html = await perform_web_search_formatted(user_prompt)
-        system_prompt = get_system_prompt(user_prompt)
-        messages = [
-            {"role": "system", "content": system_prompt},
-        ]
-        messages.extend(await get_history(conv_id, limit=4))
-        messages.append({
-            "role": "user",
-            "content": f"{user_prompt}\n\n--- Web Search Context ---\n{search_context}"
+        await save_message(user["id"], conv_id, "assistant", response_text)
+
+        return JSONResponse({
+            "response": response_text,
+            "conversation_id": conv_id
         })
 
-        async def research_event_gen():
-            task = asyncio.current_task()
-            active_streams[user["id"]] = task
-            try:
-                yield sse({"type": "conversation_id", "conversation_id": conv_id})
-                if search_html:
-                    yield sse({"type": "search_results", "html": search_html})
-                full_text = ""
-                stream_fn = stream_groq_chat if provider == "groq" else stream_openai_chat
-                use_model = chat_model if provider == "groq" else chat_model
-                async for token in stream_fn(messages, model=use_model):
-                    if task.cancelled():
-                        break
-                    full_text += token
-                    yield sse({"type": "token", "text": token})
-                await save_message(user["id"], conv_id, "assistant", full_text)
-                yield sse({"type": "done"})
-            except Exception as e:
-                logger.error(f"Research stream error: {e}")
-                yield sse({"type": "error", "message": str(e)})
-            finally:
-                active_streams.pop(user["id"], None)
 
-        return StreamingResponse(
-            research_event_gen(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            }
-        )
+# ════════════════════════════════════════════════════════════════
+# MAIN CHAT ENDPOINT — WITH PROGRESSIVE IMAGE STREAMING
+# ════════════════════════════════════════════════════════════════
 
-    # ── GENERAL CHAT / CODE / MATH (DEFAULT) ──
-    system_prompt = get_system_prompt(user_prompt)
-    messages = [
-        {"role": "system", "content": system_prompt},
-    ]
-    messages.extend(await get_history(conv_id, limit=4))
-    messages.append({"role": "user", "content": user_prompt})
+@app.post("/ask/universal")
+async def ask_universal(req: Request, res: Response):
+    """
+    Universal chat endpoint.
 
-    if req_data.stream:
-        async def chat_event_gen():
-            task = asyncio.current_task()
-            active_streams[user["id"]] = task
-            try:
-                yield sse({"type": "conversation_id", "conversation_id": conv_id})
-                full_text = ""
-                stream_fn = stream_groq_chat if provider == "groq" else stream_openai_chat
-                async for token in stream_fn(messages, model=chat_model):
-                    if task.cancelled():
-                        break
-                    full_text += token
-                    yield sse({"type": "token", "text": token})
-                await save_message(user["id"], conv_id, "assistant", full_text)
-                yield sse({"type": "done"})
-            except Exception as e:
-                logger.error(f"Chat stream error: {e}")
-                yield sse({"type": "error", "message": str(e)})
-            finally:
-                active_streams.pop(user["id"], None)
-
-        return StreamingResponse(
-            chat_event_gen(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            }
-        )
-    else:
-        try:
-            if provider == "groq":
-                reply = await groq_chat_sync(messages, model=chat_model)
-            else:
-                reply = await openai_chat_sync(messages, model=chat_model)
-            await save_message(user["id"], conv_id, "assistant", reply)
-            return {"reply": reply, "conversation_id": conv_id}
-        except Exception as e:
-            logger.error(f"Chat sync error: {e}")
-            raise HTTPException(500, str(e))
-
-
-async def handle_image_generation(
-    user: Dict,
-    conv_id: str,
-    prompt: str,
-    size: str,
-    quality: str,
-    stream: bool
-):
-    async def image_gen_stream():
-        task = asyncio.current_task()
-        active_streams[user["id"]] = task          # ← ADD
-        try:
-            yield sse({"type": "conversation_id", "conversation_id": conv_id})
-            yield sse({"type": "status", "message": "Generating image..."})
-            
-            if task.cancelled():                     # ← ADD
-                return                               # ← ADD
-                
-            image_b64 = await generate_image_openai_sync(
-                prompt=prompt,
-                size=size,
-                quality=quality
-            )
-            
-            if task.cancelled():                     # ← ADD
-                return                               # ← ADD
-            
-            data_url = f"data:image/png;base64,{image_b64}"
-            
-            yield sse({
-                "type": "image",
-                "url": data_url,
-                "prompt": prompt
-            })
-            
-            ai_response = f"Here's the generated image based on your prompt: '{prompt}'"
-            await save_message(user["id"], conv_id, "assistant", ai_response)
-            
-            yield sse({"type": "done"})
-            
-        except asyncio.CancelledError:               # ← ADD
-            logger.info(f"Image generation cancelled for user {user['id']}")
-            yield sse({"type": "cancelled"})
-        except Exception as e:
-            logger.error(f"Image generation error: {e}")
-            yield sse({"type": "error", "message": str(e)})
-        finally:                                      # ← ADD
-            active_streams.pop(user["id"], None)      # ← ADD
-    
-    if stream:
-        return StreamingResponse(
-            image_gen_stream(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            }
-        )
-    else:
-        try:
-            image_b64 = await generate_image_openai_sync(prompt, size, quality)
-            data_url = f"data:image/png;base64,{image_b64}"
-            ai_response = f"Here's the generated image based on your prompt: '{prompt}'"
-            await save_message(user["id"], conv_id, "assistant", ai_response)
-            return {
-                "reply": ai_response,
-                "conversation_id": conv_id,
-                "image_url": data_url
-            }
-        except Exception as e:
-            raise HTTPException(500, str(e))
-
-
-async def build_chat_messages(
-    user_id: str,
-    conv_id: str,
-    prompt: str,
-    mode: str,
-    image_base64: Optional[str] = None,
-    image_mime: str = "image/png",
-    model: str = "helox"
-) -> list:
-    """Build the message array for the AI API."""
-    
-    # Get conversation history
-    history = await get_history(conv_id, limit=6)
-    
-    # Select system prompt based on mode
-    if mode == "finance":
-        system_prompt = FINANCE_SYSTEM_PROMPT
-    else:
-        system_prompt = BASE_SYSTEM_PROMPT
-    
-    messages = [{"role": "system", "content": system_prompt}]
-    
-    # Add history
-    messages.extend(history)
-    
-    # Build user message
-    if image_base64:
-        # Vision message
-        clean_b64 = image_base64
-        if "," in image_base64:
-            clean_b64 = image_base64.split(",", 1)[1]
-        
-        user_content = [
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{image_mime};base64,{clean_b64}"}
-            },
-            {"type": "text", "text": prompt}
-        ]
-        messages.append({"role": "user", "content": user_content})
-    else:
-        messages.append({"role": "user", "content": prompt})
-    
-    return messages
-
-
-async def stream_chat_response(
-    user_id: str,
-    conv_id: str,
-    messages: list,
-    model: str,
-    provider: str,
-    mode: str,
-    prompt: str
-):
-    """Stream chat response with search integration."""
-    
-    task = asyncio.current_task()
-    active_streams[user_id] = task
-    
+    SSE Event Types:
+      - image_generating   : { type: "image_generating" }
+      - image_progress     : { type: "image_progress", progress: 0-100, data: "base64..." }
+      - image_generated    : { type: "image_generated", data: "base64...", size: "...", quality: "..." }
+      - image_error        : { type: "image_error", error: "..." }
+      - search_results     : { type: "search_results", html: "..." }
+      - text_delta         : { type: "text_delta", content: "..." }
+      - done               : { type: "done", conversation_id: "..." }
+    """
     try:
-        yield sse({"type": "conversation_id", "conversation_id": conv_id})
-        
-        # Perform web search if needed (research/finance mode or search keywords)
-        search_context = ""
-        search_html = ""
-        
-        if mode in ["search", "finance", "research"]:
-            yield sse({"type": "status", "message": "Searching..."})
-            search_context, search_html = await perform_web_search_formatted(prompt)
-            
-            if search_html:
-                yield sse({"type": "search_results", "html": search_html})
-            
-            if search_context and search_context != "[Search API Key missing]" and search_context != "[No search results found]":
-                # Inject search context into messages
-                search_augmented = f"""[Web Search Results]
-{search_context}
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
 
-[User Question]
-{prompt}
+    prompt = body.get("prompt", "").strip()
+    if not prompt:
+        raise HTTPException(400, "Prompt is required")
 
-Based on the search results above, provide a comprehensive answer. Cite sources as [1], [2], etc."""
-                # Update the last user message
-                messages[-1] = {"role": "user", "content": search_augmented}
-        
-        # Stream the response
-        full_text = ""
-        token_count = 0
-        
-        if provider == "openai":
-            stream_fn = stream_openai_chat(messages, model=model)
-        else:
-            stream_fn = stream_groq_chat(messages, model=model)
-        
-        async for token in stream_fn:
-            if task.cancelled():
-                break
-            
-            full_text += token
-            token_count += 1
-            
-            # Send token with metadata
-            yield sse({
-                "type": "token",
-                "text": token,
-                "token_count": token_count
-            })
-            
-            # Periodically save partial content (for recovery)
-            if token_count % 50 == 0:
-                yield sse({"type": "heartbeat", "chars": len(full_text)})
-        
-        # Save complete response
-        if full_text:
-            await save_message(user["id"], conv_id, "assistant", full_text)
-        
-        yield sse({"type": "done", "total_chars": len(full_text)})
-        
-    except asyncio.CancelledError:
-        logger.info(f"Stream cancelled for user {user_id}")
-        # Save partial response
-        if full_text:
-            await save_message(user["id"], conv_id, "assistant", full_text + "\n[Response interrupted]")
-        yield sse({"type": "cancelled"})
-        
-    except httpx.RemoteProtocolError as e:
-        logger.error(f"Connection error: {e}")
-        yield sse({"type": "error", "message": "Connection lost. Please retry.", "code": "CONNECTION_LOST"})
-        
-    except Exception as e:
-        logger.error(f"Stream error: {e}")
-        yield sse({"type": "error", "message": str(e)})
-        
-    finally:
-        active_streams.pop(user_id, None)
+    conversation_id = body.get("conversation_id")
+    remember = body.get("remember", True)
+    image_size = body.get("image_size", "1024x1024")
+    image_quality = body.get("image_quality", "medium")
+    model_key = body.get("model", "helox") or "helox"
+    mode = body.get("mode", "general")
 
+    user = await get_user_with_auth(req, res, remember)
+    user_id = user["id"]
 
-@app.post("/stop/{user_id}")
-async def stop_streaming(user_id: str, req: Request):
-    """Stop an active stream for a user."""
-    task = active_streams.get(user_id)
-    if task and not task.done():
-        task.cancel()
-        return {"status": "cancelled"}
-    return {"status": "no_active_stream"}
+    title = prompt[:50] if len(prompt) > 10 else prompt
+    conv_id = await get_or_create_conversation(user_id, conversation_id, title)
+
+    await save_message(user_id, conv_id, "user", prompt)
+
+    intent = _detector.detect(prompt)
+
+    # ── IMAGE GENERATION PATH ──
+    if intent.intent == IntentCategory.IMAGE_GENERATION:
+        async def image_stream():
+            result = {}
+
+            async for event in _stream_image_generation(
+                prompt=prompt,
+                size=image_size,
+                quality=image_quality,
+                result=result,
+            ):
+                yield event
+
+            # Stream a brief text response after the image
+            text_response = (
+                f"Here's the image I generated based on your request: "
+                f"*\"{prompt[:100]}{'...' if len(prompt) > 100 else ''}\"*"
+            )
+            for char in text_response:
+                yield sse({"type": "text_delta", "content": char})
+
+            # Combine for DB save
+            full_text = result.get("text", "") + "\n" + text_response
+
+            try:
+                await save_message(user_id, conv_id, "assistant", full_text)
+            except Exception as e:
+                logger.error(f"Failed to save image response: {e}")
+
+            yield sse({"type": "done", "conversation_id": conv_id})
+
+        return StreamingResponse(
+            image_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
+
+    # ── TEXT CHAT PATH ──
+    else:
+        async def chat_stream():
+            result = {}
+
+            async for event in _stream_chat_response(
+                prompt=prompt,
+                conversation_id=conv_id,
+                model_key=model_key,
+                mode=mode,
+                user_id=user_id,
+                result=result,
+            ):
+                yield event
+
+            full_response = result.get("text", "")
+
+            try:
+                await save_message(user_id, conv_id, "assistant", full_response)
+            except Exception as e:
+                logger.error(f"Failed to save chat response: {e}")
+
+            yield sse({"type": "done", "conversation_id": conv_id})
+
+        return StreamingResponse(
+            chat_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
+
 
 # =========================
 # NEW CHAT ENDPOINT
 # =========================
 @app.post("/newchat")
 async def new_chat(req: Request, res: Response):
-    body = {}
-    content_type = req.headers.get("content-type", "")
-
-    if "application/json" in content_type:
+    user = await get_user_with_auth(req, res)
+    try:
         body = await req.json()
-    else:
-        try:
-            body = await req.json()
-        except Exception:
-            body = {}
+    except Exception:
+        body = {}
 
-    remember = body.get("remember", True)
-    user = await get_user_with_auth(req, res, remember)
+    title = body.get("title", "New Chat")[:50]
+    new_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
 
-    conv_id = await get_or_create_conversation(
-        user_id=user["id"],
-        proposed_id=None,
-        title="New Chat"
-    )
-
-    return {
-        "conversation_id": conv_id,
-        "message": "New conversation created"
-    }
+    try:
+        await _execute_supabase_with_retry(
+            supabase.table("conversations").insert({
+                "id": new_id,
+                "user_id": user["id"],
+                "title": title,
+                "created_at": now,
+                "updated_at": now,
+            })
+        )
+        return JSONResponse({"id": new_id, "title": title})
+    except Exception as e:
+        logger.error(f"Failed to create chat: {e}")
+        raise HTTPException(500, "Failed to create chat")
 
 
 # =========================
-# LIST CHATS ENDPOINT
+# LIST CHATS
 # =========================
 @app.get("/chats")
 async def list_chats(req: Request, res: Response):
     user = await get_user_with_auth(req, res)
-
-    result = await _execute_supabase_with_retry(
-        supabase.table("conversations")
-        .select("id, title, created_at, updated_at")
-        .eq("user_id", user["id"])
-        .order("updated_at", desc=True)
-        .limit(100)
-    )
-
-    chats = []
-    for c in (result.data or []):
-        # Get message count for each conversation
-        msg_result = await _execute_supabase_with_retry(
-            supabase.table("messages")
-            .select("id", count="exact")
-            .eq("conversation_id", c["id"])
+    try:
+        result = await _execute_supabase_with_retry(
+            supabase.table("conversations")
+            .select("id, title, created_at, updated_at")
+            .eq("user_id", user["id"])
+            .order("updated_at", desc=True)
+            .limit(100)
         )
-        msg_count = msg_result.count if hasattr(msg_result, 'count') else 0
-
-        chats.append({
-            "id": c["id"],
-            "title": c.get("title", "Untitled"),
-            "created_at": c.get("created_at"),
-            "updated_at": c.get("updated_at"),
-            "message_count": msg_count
-        })
-
-    return {"chats": chats}
+        return JSONResponse({"chats": result.data or []})
+    except Exception as e:
+        logger.error(f"Failed to list chats: {e}")
+        raise HTTPException(500, "Failed to list chats")
 
 
 # =========================
-# DELETE CHAT ENDPOINT
+# DELETE CHAT
 # =========================
 @app.delete("/chats/{chat_id}")
 async def delete_chat(chat_id: str, req: Request, res: Response):
     user = await get_user_with_auth(req, res)
 
-    # Verify ownership
-    check = await _execute_supabase_with_retry(
-        supabase.table("conversations")
-        .select("id")
-        .eq("id", chat_id)
-        .eq("user_id", user["id"])
-        .limit(1)
-    )
+    try:
+        check = await _execute_supabase_with_retry(
+            supabase.table("conversations")
+            .select("id")
+            .eq("id", chat_id)
+            .eq("user_id", user["id"])
+            .limit(1)
+        )
+        if not check.data:
+            raise HTTPException(404, "Chat not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Chat ownership check failed: {e}")
+        raise HTTPException(500, "Failed to verify chat ownership")
 
-    if not check.data:
-        raise HTTPException(404, "Conversation not found")
-
-    # Delete messages first
-    await _execute_supabase_with_retry(
-        supabase.table("messages")
-        .delete()
-        .eq("conversation_id", chat_id)
-    )
-
-    # Delete conversation
-    await _execute_supabase_with_retry(
-        supabase.table("conversations")
-        .delete()
-        .eq("id", chat_id)
-    )
-
-    # Cancel active stream if any
-    if user["id"] in active_streams:
-        active_streams[user["id"]].cancel()
-        active_streams.pop(user["id"], None)
-
-    return {"message": "Conversation deleted", "conversation_id": chat_id}
+    try:
+        await _execute_supabase_with_retry(
+            supabase.table("messages")
+            .delete()
+            .eq("conversation_id", chat_id)
+        )
+        await _execute_supabase_with_retry(
+            supabase.table("conversations")
+            .delete()
+            .eq("id", chat_id)
+        )
+        return JSONResponse({"deleted": True})
+    except Exception as e:
+        logger.error(f"Failed to delete chat: {e}")
+        raise HTTPException(500, "Failed to delete chat")
 
 
 # =========================
-# GET MESSAGES ENDPOINT
+# GET MESSAGES
 # =========================
 @app.get("/chat/{conversation_id}/messages")
 async def get_messages(conversation_id: str, req: Request, res: Response):
     user = await get_user_with_auth(req, res)
 
-    # Verify ownership
-    check = await _execute_supabase_with_retry(
-        supabase.table("conversations")
-        .select("id")
-        .eq("id", conversation_id)
-        .eq("user_id", user["id"])
-        .limit(1)
-    )
+    try:
+        check = await _execute_supabase_with_retry(
+            supabase.table("conversations")
+            .select("id")
+            .eq("id", conversation_id)
+            .eq("user_id", user["id"])
+            .limit(1)
+        )
+        if not check.data:
+            raise HTTPException(404, "Chat not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Message ownership check failed: {e}")
+        raise HTTPException(500, "Failed to verify chat")
 
-    if not check.data:
-        raise HTTPException(404, "Conversation not found")
-
-    result = await _execute_supabase_with_retry(
-        supabase.table("messages")
-        .select("id, role, content, created_at")
-        .eq("conversation_id", conversation_id)
-        .order("created_at", desc=False)
-    )
-
-    return {"messages": result.data or []}
+    try:
+        result = await _execute_supabase_with_retry(
+            supabase.table("messages")
+            .select("id, role, content, created_at")
+            .eq("conversation_id", conversation_id)
+            .order("created_at", desc=False)
+        )
+        return JSONResponse({"messages": result.data or []})
+    except Exception as e:
+        logger.error(f"Failed to get messages: {e}")
+        raise HTTPException(500, "Failed to get messages")
 
 
 # =========================
@@ -2135,27 +1876,30 @@ async def get_messages(conversation_id: str, req: Request, res: Response):
 # =========================
 @app.post("/tts")
 async def text_to_speech(req: Request, res: Response):
-    if not OPENAI_API_KEY:
-        raise HTTPException(500, "OpenAI API Key not configured for TTS")
-
     user = await get_user_with_auth(req, res)
-    body = await req.json()
 
-    text = body.get("text", "")
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "TTS not configured")
+
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+
+    text = body.get("text", "").strip()
     voice = body.get("voice", "alloy")
 
-    valid_voices = ["alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer"]
+    if not text:
+        raise HTTPException(400, "Text is required")
+    if len(text) > 4096:
+        raise HTTPException(400, "Text too long (max 4096 chars)")
+
+    valid_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
     if voice not in valid_voices:
         voice = "alloy"
 
-    if not text.strip():
-        raise HTTPException(400, "Text is required")
-
-    # Trim text to TTS limits
-    text = text[:4096]
-
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 "https://api.openai.com/v1/audio/speech",
                 headers=get_openai_headers(),
@@ -2163,41 +1907,38 @@ async def text_to_speech(req: Request, res: Response):
                     "model": OPENAI_TTS_MODEL,
                     "input": text,
                     "voice": voice,
-                    "response_format": "mp3"
+                    "response_format": "mp3",
                 }
             )
             resp.raise_for_status()
 
-            return Response(
-                content=resp.content,
+            return StreamingResponse(
+                io.BytesIO(resp.content),
                 media_type="audio/mpeg",
                 headers={
                     "Content-Disposition": "inline; filename=speech.mp3"
                 }
             )
     except httpx.HTTPStatusError as e:
-        logger.error(f"TTS Error: {e.response.status_code} - {e.response.text}")
-        raise HTTPException(500, f"TTS generation failed: {e.response.text}")
+        logger.error(f"TTS error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(502, f"TTS API error: {e.response.status_code}")
     except Exception as e:
-        logger.error(f"TTS Error: {e}")
-        raise HTTPException(500, f"TTS generation failed: {str(e)}")
+        logger.error(f"TTS failed: {e}")
+        raise HTTPException(500, "TTS generation failed")
 
 
-# =========================
-# TTS VOICES ENDPOINT
-# =========================
 @app.get("/tts/voices")
-async def list_tts_voices(req: Request, res: Response):
-    await get_user_with_auth(req, res)
-
-    voices = [
-        {"id": "alloy", "name": "Alloy", "description": "Balanced and neutral"},
-        {"id": "nova", "name": "Nova", "description": "Friendly and upbeat"},
-        {"id": "sage", "name": "Sage", "description": "Calm and wise"},
-        {"id": "shimmer", "name": "Shimmer", "description": "Soft and gentle"},
-    ]
-
-    return {"voices": voices}
+async def list_tts_voices():
+    return JSONResponse({
+        "voices": [
+            {"id": "alloy", "name": "Alloy", "description": "Balanced and neutral"},
+            {"id": "echo", "name": "Echo", "description": "Warm and clear"},
+            {"id": "fable", "name": "Fable", "description": "Expressive and storytelling"},
+            {"id": "onyx", "name": "Onyx", "description": "Deep and authoritative"},
+            {"id": "nova", "name": "Nova", "description": "Friendly and upbeat"},
+            {"id": "shimmer", "name": "Shimmer", "description": "Soft and gentle"},
+        ]
+    })
 
 
 # =========================
@@ -2208,60 +1949,47 @@ async def speech_to_text(
     req: Request,
     res: Response,
     file: UploadFile = File(...),
-    language: Optional[str] = Form(None),
 ):
-    if not GROQ_API_KEY:
-        raise HTTPException(500, "Groq API Key not configured for STT")
-
     user = await get_user_with_auth(req, res)
 
-    # Read audio file
+    if not GROQ_API_KEY:
+        raise HTTPException(500, "STT not configured")
+
     audio_bytes = b""
     while chunk := await file.read(1024 * 1024):
         audio_bytes += chunk
         if len(audio_bytes) > MAX_FILE_SIZE:
             raise HTTPException(413, "Audio file too large")
 
-    if len(audio_bytes) == 0:
+    if not audio_bytes:
         raise HTTPException(400, "Empty audio file")
 
-    # Determine file extension for Groq
-    filename = file.filename or "audio.wav"
-    ext = Path(filename).suffix.lower()
-
-    # Groq expects specific formats
-    valid_extensions = {'.wav', '.mp3', '.mp4', '.m4a', '.webm', '.ogg', '.flac'}
-    if ext not in valid_extensions:
-        # Default to wav
-        ext = ".wav"
-
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 "https://api.groq.com/openai/v1/audio/transcriptions",
                 headers=get_groq_headers_multipart(),
                 files={
-                    "file": (f"audio{ext}", audio_bytes, f"audio/{ext[1:]}")
+                    "file": (file.filename or "audio.wav", audio_bytes),
                 },
                 data={
                     "model": GROQ_STT_MODEL,
-                    "language": language or "en",
-                    "response_format": "json"
+                    "response_format": "json",
+                    "language": "en",
                 }
             )
             resp.raise_for_status()
-            result = resp.json()
-
-            return {
-                "text": result.get("text", ""),
-                "language": language or "en"
-            }
+            data = resp.json()
+            return JSONResponse({
+                "text": data.get("text", ""),
+                "language": data.get("language", "en")
+            })
     except httpx.HTTPStatusError as e:
-        logger.error(f"STT Error: {e.response.status_code} - {e.response.text}")
-        raise HTTPException(500, f"Speech-to-text failed: {e.response.text}")
+        logger.error(f"STT error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(502, f"STT API error: {e.response.status_code}")
     except Exception as e:
-        logger.error(f"STT Error: {e}")
-        raise HTTPException(500, f"Speech-to-text failed: {str(e)}")
+        logger.error(f"STT failed: {e}")
+        raise HTTPException(500, "Speech transcription failed")
 
 
 # =========================
@@ -2274,48 +2002,107 @@ async def logout(req: Request, res: Response):
 
     if user_id and token:
         try:
-            # Invalidate session in DB
             await _execute_supabase_with_retry(
                 supabase.table("user_sessions")
                 .update({"is_valid": False})
                 .eq("user_id", user_id)
                 .eq("token", token)
             )
-            # Clear cache
-            _session_cache.pop(user_id, None)
         except Exception as e:
-            logger.error(f"Logout error: {e}")
+            logger.error(f"Failed to invalidate session: {e}")
 
-    # Cancel active stream if any
-    if user_id and user_id in active_streams:
-        active_streams[user_id].cancel()
-        active_streams.pop(user_id, None)
+    if user_id and user_id in _session_cache:
+        del _session_cache[user_id]
 
     clear_session_cookies(res)
-    return {"message": "Logged out successfully"}
+    return JSONResponse({"logged_out": True})
 
 
 # =========================
-# PERIODIC CLEANUP (OPTIONAL)
+# ANALYSIS JSON ENDPOINT (non-streaming)
 # =========================
-async def _cleanup_stale_locks():
-    """Periodically clean up stale conversation creation locks."""
-    while True:
-        await asyncio.sleep(300)  # Every 5 minutes
-        if _conv_creation_locks:
-            logger.debug(f"Cleaning up {len(_conv_creation_locks)} stale conv locks")
-            _conv_creation_locks.clear()
+@app.post("/analysis/json")
+async def analyze_file_json(
+    req: Request,
+    res: Response,
+    file: Optional[UploadFile] = File(None),
+    prompt: Optional[str] = Form(None),
+    conversation_id: Optional[str] = Form(None),
+    analysis_type: Optional[str] = Form(None),
+    image_base64: Optional[str] = Form(None),
+    image_mime: Optional[str] = Form("image/png"),
+):
+    user = await get_user_with_auth(req, res)
 
+    image_data_b64 = None
+    image_mime_type = image_mime or "image/png"
+    file_text_content = None
+    file_filename = "unknown"
+    file_category = FileCategory.UNKNOWN
 
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(_cleanup_stale_locks())
-    logger.info("HeloxAi Lite v4.0.0 started")
+    if image_base64:
+        clean_b64 = image_base64
+        if "," in image_base64:
+            clean_b64 = image_base64.split(",", 1)[1]
+        image_data_b64 = clean_b64.strip()
+        file_category = FileCategory.IMAGE
+    elif file and file.filename:
+        file_filename = file.filename
+        content_bytes = b""
+        while chunk := await file.read(1024 * 1024):
+            content_bytes += chunk
+            if len(content_bytes) > MAX_FILE_SIZE:
+                raise HTTPException(413, "File too large")
 
+        if not content_bytes:
+            raise HTTPException(400, "Empty file")
 
-# =========================
-# HEALTH CHECK
-# =========================
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+        if analysis_type and analysis_type != "auto":
+            try:
+                file_category = FileCategory(analysis_type)
+            except ValueError:
+                file_category = get_file_category(file_filename)
+        else:
+            file_category = get_file_category(file_filename)
+
+        if file.content_type and _is_image_mime(file.content_type):
+            file_category = FileCategory.IMAGE
+
+        if file_category == FileCategory.IMAGE:
+            image_data_b64 = base64.b64encode(content_bytes).decode()
+            image_mime_type = file.content_type or "image/png"
+        else:
+            file_text_content = await extract_text_safe(content_bytes)
+            if not file_text_content.strip() or file_text_content.strip() == "[Binary or unreadable content]":
+                raise HTTPException(400, f"Could not extract text from: {file_filename}")
+    else:
+        raise HTTPException(400, "Either 'file' or 'image_base64' required")
+
+    conv_id = await get_or_create_conversation(
+        user["id"], conversation_id,
+        f"Analysis: {file_filename}" if file_filename else "Image Analysis"
+    )
+
+    user_msg = prompt or f"[Uploaded {file_filename} for analysis]"
+    await save_message(user["id"], conv_id, "user", user_msg)
+
+    if file_category == FileCategory.IMAGE:
+        messages = _build_image_analysis_messages(image_data_b64, image_mime_type, prompt)
+    else:
+        language = get_language_from_extension(file_filename)
+        if file_category == FileCategory.CODE:
+            messages = _build_code_analysis_messages(file_text_content, file_filename, language, prompt)
+        else:
+            messages = _build_document_analysis_messages(file_text_content, file_filename, prompt)
+
+    try:
+        response_text = await groq_chat_sync(messages, model=GROQ_VISION_MODEL)
+    except Exception as e:
+        response_text = f"[Analysis error: {str(e)}]"
+
+    await save_message(user["id"], conv_id, "assistant", response_text)
+
+    return JSONResponse({
+        "response": response_text,
+        "conversation_id": conv_id
+    })
