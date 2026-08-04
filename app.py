@@ -768,17 +768,22 @@ async def get_or_create_conversation(
     lock = _get_conv_lock(lock_key)
 
     async with lock:
-        if proposed_id:
-            check = await _execute_supabase_with_retry(
-                supabase.table("conversations")
-                .select("id")
-                .eq("id", proposed_id)
-                .limit(1)
-            )
-            if check.data:
-                _conv_creation_locks.pop(lock_key, None)
-                return proposed_id
-            logger.warning(f"Conversation ID {proposed_id} provided but not found in DB.")
+                if proposed_id:
+            # Retry up to 3 times with 200ms delay to handle
+            # Supabase eventual consistency after /newchat
+            for _retry in range(3):
+                check = await _execute_supabase_with_retry(
+                    supabase.table("conversations")
+                    .select("id")
+                    .eq("id", proposed_id)
+                    .limit(1)
+                )
+                if check.data:
+                    _conv_creation_locks.pop(lock_key, None)
+                    return proposed_id
+                if _retry < 2:
+                    await asyncio.sleep(0.2)
+            logger.warning(f"Conversation ID {proposed_id} provided but not found in DB after retries.")
 
         new_id = str(uuid.uuid4())
         logger.info(f"Creating new conversation: {new_id}")
