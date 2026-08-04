@@ -768,7 +768,7 @@ async def get_or_create_conversation(
     lock = _get_conv_lock(lock_key)
 
     async with lock:
-                if proposed_id:
+        if proposed_id:
             # Retry up to 3 times with 200ms delay to handle
             # Supabase eventual consistency after /newchat
             for _retry in range(3):
@@ -799,7 +799,6 @@ async def get_or_create_conversation(
         )
         _conv_creation_locks.pop(lock_key, None)
         return new_id
-
 
 # =========================
 # API INTEGRATIONS
