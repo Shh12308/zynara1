@@ -1240,27 +1240,12 @@ Provide a thorough analysis: summary, key points, structure, issues, and recomme
 # mutable `result` dict that the generator writes to.
 # ════════════════════════════════════════════════════════════════
 
-async def _stream_image_generation(
-    prompt: str,
-    size: str,
-    quality: str,
-    result: dict,
-):
-    """
-    Handle the full image generation pipeline with progressive streaming.
-
-    Yields SSE event strings.
-    Writes the response text to result["text"] for DB saving.
-    """
+async def _stream_image_generation(prompt, size, quality, result):
     yield sse({"type": "image_generating"})
-
     try:
-        image_b64 = await generate_image_openai_sync(
-            prompt, size=size, quality=quality
-        )
-
+        image_b64 = await generate_image_openai_sync(prompt, size=size, quality=quality)
         frames = generate_progressive_frames(image_b64, steps=8)
-
+        
         for frame in frames:
             yield sse({
                 "type": "image_progress",
@@ -1268,7 +1253,14 @@ async def _stream_image_generation(
                 "data": frame["data"]
             })
             await asyncio.sleep(0.08)
-
+        
+        # DETERMINE MIME TYPE
+        is_png = not image_b64.startswith('/9j/')
+        mime = "data:image/png;base64," if is_png else "data:image/jpeg;base64,"
+        
+        # CREATE MARKDOWN IMAGE TAG TO SAVE IN DATABASE
+        markdown_image = f"![Generated Image]({mime}{image_b64})"
+        
         yield sse({
             "type": "image_generated",
             "data": image_b64,
@@ -1276,19 +1268,21 @@ async def _stream_image_generation(
             "quality": quality
         })
 
-        result["text"] = f"[Generated image: {size}, {quality} quality]"
+        # STREAM A BRIEF TEXT RESPONSE
+        text_response = f"\n\nHere's the image I generated based on your request: *\"{prompt[:100]}{'...' if len(prompt) > 100 else ''}\"*"
+        for char in text_response:
+            yield sse({"type": "text_delta", "content": char})
+
+        # COMBINE MARKDOWN IMAGE + TEXT FOR DATABASE SAVING
+        result["text"] = markdown_image + text_response
 
     except Exception as e:
         error_str = str(e)
         logger.error(f"Image generation stream error: {error_str}")
-        yield sse({
-            "type": "image_error",
-            "error": error_str
-        })
+        yield sse({"type": "image_error", "error": error_str})
         result["text"] = f"[Image generation failed: {error_str}]"
 
     return
-
 
 async def _stream_chat_response(
     prompt: str,
