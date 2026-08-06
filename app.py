@@ -51,8 +51,8 @@ GROQ_MAX_RETRIES = 3
 
 app = FastAPI(
     title="HeloxAi Lite",
-    description="Text, Code, Math, Research, Image Generation & File Analysis Backend",
-    version="4.1.0"
+    description="Text, Code, Math, Research, Image/Video Generation & File Analysis Backend",
+    version="4.2.0"
 )
 
 # =========================
@@ -531,6 +531,7 @@ class IntentCategory(Enum):
     MATHEMATICAL = "mathematical"
     RESEARCH = "research"
     IMAGE_GENERATION = "image_generation"
+    VIDEO_GENERATION = "video_generation"
     CONVERSATION = "conversation"
 
 
@@ -585,6 +586,13 @@ class AdvancedIntentDetector:
                 r'\b(\w+\s+){0,3}(image|picture|art|drawing|illustration|photo|painting)\s+(of|for|showing|depicting)',
                 r'^\s*(generate|create|make|draw|render)\s+',
             ],
+            IntentCategory.VIDEO_GENERATION: [
+                r'\b(generate|create|make|render)\s+(a?\s+)?(video|clip|animation|movie|film)',
+                r'\bvideo\s+of\s+',
+                r'\banimate\s+',
+                r'\b(\w+\s+){0,3}(video|clip|animation|movie)\s+(of|for|showing|depicting)',
+                r'^\s*(generate|create|make|render)\s+(a?\s+)?video',
+            ],
             IntentCategory.CONVERSATION: [
                 r'^(hello|hi|hey|thanks)',
                 r'^(how\s+are\s+you)'
@@ -596,6 +604,13 @@ class AdvancedIntentDetector:
         }
 
     def detect(self, text: str) -> IntentResult:
+        # Check Video first to prevent it falling into Image
+        for intent in [IntentCategory.VIDEO_GENERATION]:
+            patterns = self.compiled_patterns.get(intent, [])
+            matches = sum(1 for p in patterns if p.search(text))
+            if matches > 0:
+                return IntentResult(intent=intent, confidence=min(0.6 + matches * 0.1, 0.98))
+
         for intent in [IntentCategory.IMAGE_GENERATION]:
             patterns = self.compiled_patterns.get(intent, [])
             matches = sum(1 for p in patterns if p.search(text))
@@ -603,7 +618,7 @@ class AdvancedIntentDetector:
                 return IntentResult(intent=intent, confidence=min(0.6 + matches * 0.1, 0.98))
 
         for intent, patterns in self.compiled_patterns.items():
-            if intent == IntentCategory.IMAGE_GENERATION:
+            if intent in [IntentCategory.IMAGE_GENERATION, IntentCategory.VIDEO_GENERATION]:
                 continue
             matches = sum(1 for p in patterns if p.search(text))
             if matches > 0:
@@ -1015,7 +1030,7 @@ async def stream_openai_chat(messages: list, model: str = "gpt-4o-mini"):
                             if delta:
                                 yield delta
                         except (json.JSONDecodeError, KeyError, IndexError):
-                            pass
+                                pass
         except httpx.RemoteProtocolError:
             raise
 
@@ -1116,17 +1131,6 @@ def generate_progressive_frames(image_b64: str, steps: int = 8) -> list:
     """
     Convert a base64 image into multiple JPEG quality levels
     for progressive streaming to the frontend.
-
-    Each frame is a COMPLETE valid JPEG that the browser can
-    render instantly. Quality increases with each frame,
-    creating the "image sharpening over time" effect.
-
-    Args:
-        image_b64: Base64-encoded image (PNG from OpenAI, or JPEG)
-        steps: Number of progressive quality levels (default 8)
-
-    Returns:
-        List of dicts: [{"progress": int, "data": str}, ...]
     """
     try:
         image_bytes = base64.b64decode(image_b64)
@@ -1233,19 +1237,28 @@ Provide a thorough analysis: summary, key points, structure, issues, and recomme
 
 # ════════════════════════════════════════════════════════════════
 # STREAMING GENERATORS
-#
-# NOTE: These are async generators (use `yield`). Python does NOT
-# allow `return <value>` in async generators — only bare `return`
-# to stop iteration. To pass data back to the caller, we use a
-# mutable `result` dict that the generator writes to.
 # ════════════════════════════════════════════════════════════════
 
-async def _stream_image_generation(prompt, size, quality, result):
+async def _stream_image_generation(
+    prompt: str,
+    size: str,
+    quality: str,
+    result: dict,
+):
+    """
+    Handle the full image generation pipeline with progressive streaming.
+    Yields SSE event strings.
+    Writes the response text to result["text"] for DB saving.
+    """
     yield sse({"type": "image_generating"})
+
     try:
-        image_b64 = await generate_image_openai_sync(prompt, size=size, quality=quality)
+        image_b64 = await generate_image_openai_sync(
+            prompt, size=size, quality=quality
+        )
+
         frames = generate_progressive_frames(image_b64, steps=8)
-        
+
         for frame in frames:
             yield sse({
                 "type": "image_progress",
@@ -1253,7 +1266,7 @@ async def _stream_image_generation(prompt, size, quality, result):
                 "data": frame["data"]
             })
             await asyncio.sleep(0.08)
-        
+
         # DETERMINE MIME TYPE
         is_png = not image_b64.startswith('/9j/')
         mime = "data:image/png;base64," if is_png else "data:image/jpeg;base64,"
@@ -1268,21 +1281,61 @@ async def _stream_image_generation(prompt, size, quality, result):
             "quality": quality
         })
 
-        # STREAM A BRIEF TEXT RESPONSE
-        text_response = f"\n\nHere's the image I generated based on your request: *\"{prompt[:100]}{'...' if len(prompt) > 100 else ''}\"*"
-        for char in text_response:
-            yield sse({"type": "text_delta", "content": char})
-
-        # COMBINE MARKDOWN IMAGE + TEXT FOR DATABASE SAVING
-        result["text"] = markdown_image + text_response
+        result["text"] = markdown_image
 
     except Exception as e:
         error_str = str(e)
         logger.error(f"Image generation stream error: {error_str}")
-        yield sse({"type": "image_error", "error": error_str})
+        yield sse({
+            "type": "image_error",
+            "error": error_str
+        })
         result["text"] = f"[Image generation failed: {error_str}]"
 
     return
+
+
+async def _stream_video_generation(
+    prompt: str,
+    result: dict,
+):
+    """
+    Handle the video generation pipeline.
+    Yields SSE event strings.
+    Writes the response text to result["text"] for DB saving.
+    """
+    yield sse({"type": "video_generating"})
+
+    try:
+        # TODO: Replace with actual video generation API call (e.g., Replicate, RunwayML, OpenAI Sora)
+        # Simulating API delay for UI demonstration
+        await asyncio.sleep(3)
+        
+        # Placeholder video URL (Big Buck Bunny)
+        video_url = "https://www.w3schools.com/html/mov_bbb.mp4"
+        
+        # CREATE MARKDOWN VIDEO TAG TO SAVE IN DATABASE
+        markdown_video = f"[![Generated Video]({video_url})]({video_url})"
+        
+        yield sse({
+            "type": "video_generated",
+            "url": video_url,
+            "prompt": prompt
+        })
+
+        result["text"] = markdown_video
+
+    except Exception as e:
+        error_str = str(e)
+        logger.error(f"Video generation stream error: {error_str}")
+        yield sse({
+            "type": "video_error",
+            "error": error_str
+        })
+        result["text"] = f"[Video generation failed: {error_str}]"
+
+    return
+
 
 async def _stream_chat_response(
     prompt: str,
@@ -1294,9 +1347,6 @@ async def _stream_chat_response(
 ):
     """
     Handle text chat with optional web search, streaming tokens.
-
-    Yields SSE event strings.
-    Writes the full response text to result["text"] for DB saving.
     """
     model_config = MODEL_ROUTING.get(model_key, MODEL_ROUTING["helox"])
     chat_model = model_config["chat"]
@@ -1392,7 +1442,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Lite",
-        "version": "4.1.0",
+        "version": "4.2.0",
         "models": {
             "chat": GROQ_CHAT_MODEL,
             "vision": GROQ_VISION_MODEL,
@@ -1402,7 +1452,7 @@ async def root():
         },
         "features": [
             "chat", "code", "math", "web_search", "tts", "stt",
-            "image_generation", "image_analysis", "code_analysis",
+            "image_generation", "video_generation", "image_analysis", "code_analysis",
             "document_analysis", "finance", "model_routing", "mode_routing",
             "progressive_image_streaming"
         ],
@@ -1623,7 +1673,7 @@ async def analyze_file(
 
 
 # ════════════════════════════════════════════════════════════════
-# MAIN CHAT ENDPOINT — WITH PROGRESSIVE IMAGE STREAMING
+# MAIN CHAT ENDPOINT — WITH PROGRESSIVE IMAGE/VIDEO STREAMING
 # ════════════════════════════════════════════════════════════════
 
 @app.post("/ask/universal")
@@ -1636,6 +1686,9 @@ async def ask_universal(req: Request, res: Response):
       - image_progress     : { type: "image_progress", progress: 0-100, data: "base64..." }
       - image_generated    : { type: "image_generated", data: "base64...", size: "...", quality: "..." }
       - image_error        : { type: "image_error", error: "..." }
+      - video_generating   : { type: "video_generating" }
+      - video_generated    : { type: "video_generated", url: "...", prompt: "..." }
+      - video_error        : { type: "video_error", error: "..." }
       - search_results     : { type: "search_results", html: "..." }
       - text_delta         : { type: "text_delta", content: "..." }
       - done               : { type: "done", conversation_id: "..." }
@@ -1666,6 +1719,43 @@ async def ask_universal(req: Request, res: Response):
 
     intent = _detector.detect(prompt)
 
+    # ── VIDEO GENERATION PATH ──
+    if intent.intent == IntentCategory.VIDEO_GENERATION:
+        async def video_stream():
+            result = {}
+
+            async for event in _stream_video_generation(
+                prompt=prompt,
+                result=result,
+            ):
+                yield event
+
+            text_response = (
+                f"\n\nHere's the video I generated based on your request: "
+                f"*\"{prompt[:100]}{'...' if len(prompt) > 100 else ''}\"*"
+            )
+            for char in text_response:
+                yield sse({"type": "text_delta", "content": char})
+
+            full_text = result.get("text", "") + text_response
+
+            try:
+                await save_message(user_id, conv_id, "assistant", full_text)
+            except Exception as e:
+                logger.error(f"Failed to save video response: {e}")
+
+            yield sse({"type": "done", "conversation_id": conv_id})
+
+        return StreamingResponse(
+            video_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
+
     # ── IMAGE GENERATION PATH ──
     if intent.intent == IntentCategory.IMAGE_GENERATION:
         async def image_stream():
@@ -1679,16 +1769,14 @@ async def ask_universal(req: Request, res: Response):
             ):
                 yield event
 
-            # Stream a brief text response after the image
             text_response = (
-                f"Here's the image I generated based on your request: "
+                f"\n\nHere's the image I generated based on your request: "
                 f"*\"{prompt[:100]}{'...' if len(prompt) > 100 else ''}\"*"
             )
             for char in text_response:
                 yield sse({"type": "text_delta", "content": char})
 
-            # Combine for DB save
-            full_text = result.get("text", "") + "\n" + text_response
+            full_text = result.get("text", "") + text_response
 
             try:
                 await save_message(user_id, conv_id, "assistant", full_text)
