@@ -39,6 +39,13 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY").strip() if os.getenv("GROQ_API_KEY") el
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
+# fal.ai — real video generation
+FAL_KEY = os.getenv("FAL_KEY")
+FAL_VIDEO_MODEL = os.getenv("FAL_VIDEO_MODEL", "fal-ai/wan")
+FAL_VIDEO_MAX_WAIT = int(os.getenv("FAL_VIDEO_MAX_WAIT", "240"))   # seconds (4 min)
+FAL_VIDEO_POLL_INTERVAL = float(os.getenv("FAL_VIDEO_POLL_INTERVAL", "2.0"))
+FAL_VIDEO_MAX_POLL_ERRORS = 5
+
 MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_TEXT_LENGTH = 100000
 MAX_IMAGE_SIZE = 20 * 1024 * 1024
@@ -50,7 +57,7 @@ GROQ_MAX_RETRIES = 3
 
 
 app = FastAPI(
-    title="HeloxAi Lite",
+    title="HeloxAI Lite",
     description="Text, Code, Math, Research, Image/Video Generation & File Analysis Backend",
     version="4.2.0"
 )
@@ -1124,6 +1131,114 @@ async def generate_image_openai_sync(
 
 
 # ════════════════════════════════════════════════════════════════
+# FAL.AI REAL VIDEO GENERATION
+# ════════════════════════════════════════════════════════════════
+
+def get_fal_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Key {FAL_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def _extract_video_url(result: Dict[str, Any]) -> Optional[str]:
+    """Extract a video URL from a fal.ai result (handles multiple schemas)."""
+    if not result:
+        return None
+
+    # {"video": {"url": "..."}}
+    if isinstance(result.get("video"), dict):
+        return result["video"].get("url")
+
+    # {"videos": [{"url": "..."}]} or {"videos": {"url": "..."}}
+    if "videos" in result:
+        vids = result["videos"]
+        if isinstance(vids, list) and vids:
+            return vids[0].get("url") if isinstance(vids[0], dict) else None
+        if isinstance(vids, dict):
+            return vids.get("url")
+
+    # {"output": "url"} or {"output": [{"url": "..."}]}  (some legacy models)
+    if "output" in result:
+        out = result["output"]
+        if isinstance(out, str):
+            return out
+        if isinstance(out, dict):
+            return out.get("url")
+        if isinstance(out, list) and out:
+            item = out[0]
+            return item.get("url") if isinstance(item, dict) else item
+
+    # {"url": "..."}
+    if "url" in result:
+        return result["url"]
+
+    return None
+
+
+async def submit_fal_video_request(prompt: str) -> str:
+    """Submit a text-to-video request to fal.ai queue. Returns request_id."""
+    if not FAL_KEY:
+        raise Exception("FAL_KEY is not configured")
+
+    url = f"https://queue.fal.run/{FAL_VIDEO_MODEL}"
+    payload = {"prompt": prompt}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, headers=get_fal_headers(), json=payload)
+        if resp.status_code != 200:
+            raise Exception(
+                f"fal.ai submit failed ({resp.status_code}): {resp.text}"
+            )
+        data = resp.json()
+        request_id = data.get("request_id")
+        if not request_id:
+            raise Exception(f"fal.ai submit returned no request_id: {data}")
+        return request_id
+
+
+async def poll_fal_video_status(request_id: str) -> Dict[str, Any]:
+    url = (
+        f"https://queue.fal.run/{FAL_VIDEO_MODEL}"
+        f"/requests/{request_id}/status"
+    )
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, headers=get_fal_headers())
+        if resp.status_code != 200:
+            raise Exception(
+                f"fal.ai status check failed ({resp.status_code}): {resp.text}"
+            )
+        return resp.json()
+
+
+async def get_fal_video_result(request_id: str) -> Dict[str, Any]:
+    url = (
+        f"https://queue.fal.run/{FAL_VIDEO_MODEL}"
+        f"/requests/{request_id}"
+    )
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, headers=get_fal_headers())
+        if resp.status_code != 200:
+            raise Exception(
+                f"fal.ai result fetch failed ({resp.status_code}): {resp.text}"
+            )
+        return resp.json()
+
+
+async def cancel_fal_video_request(request_id: str):
+    """Best-effort cancellation of a fal.ai video request."""
+    try:
+        url = (
+            f"https://queue.fal.run/{FAL_VIDEO_MODEL}"
+            f"/requests/{request_id}"
+        )
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.delete(url, headers=get_fal_headers())
+    except Exception as e:
+        logger.warning(f"Failed to cancel fal.ai request {request_id}: {e}")
+
+
+# ════════════════════════════════════════════════════════════════
 # PROGRESSIVE IMAGE STREAMING
 # ════════════════════════════════════════════════════════════════
 
@@ -1300,30 +1415,164 @@ async def _stream_video_generation(
     result: dict,
 ):
     """
-    Handle the video generation pipeline.
+    Real video generation via fal.ai with progressive status streaming.
     Yields SSE event strings.
     Writes the response text to result["text"] for DB saving.
+
+    SSE events emitted:
+      - video_generating
+      - video_status     (status, message)
+      - video_progress    (progress 0-100, status, message)
+      - video_generated   (url, prompt)
+      - video_error       (error)
     """
+    if not FAL_KEY:
+        error_msg = "Video generation is not configured (FAL_KEY missing)."
+        logger.error(error_msg)
+        yield sse({"type": "video_error", "error": error_msg})
+        result["text"] = f"[{error_msg}]"
+        return
+
     yield sse({"type": "video_generating"})
 
+    request_id: Optional[str] = None
     try:
-        # TODO: Replace with actual video generation API call (e.g., Replicate, RunwayML, OpenAI Sora)
-        # Simulating API delay for UI demonstration
-        await asyncio.sleep(3)
-        
-        # Placeholder video URL (Big Buck Bunny)
-        video_url = "https://www.w3schools.com/html/mov_bbb.mp4"
-        
-        # CREATE MARKDOWN VIDEO TAG TO SAVE IN DATABASE
-        markdown_video = f"[![Generated Video]({video_url})]({video_url})"
-        
+        # ── Submit the request ──────────────────────────────────────
+        request_id = await submit_fal_video_request(prompt)
+        logger.info(
+            f"fal.ai video request submitted: {request_id} "
+            f"(model={FAL_VIDEO_MODEL})"
+        )
+
         yield sse({
-            "type": "video_generated",
-            "url": video_url,
-            "prompt": prompt
+            "type": "video_status",
+            "status": "queued",
+            "message": "Request submitted — waiting in queue…"
+        })
+        yield sse({
+            "type": "video_progress",
+            "progress": 2,
+            "status": "queued",
+            "message": "Queued…"
         })
 
-        result["text"] = markdown_video
+        # ── Poll for status updates ─────────────────────────────────
+        elapsed = 0.0
+        last_progress = 0
+        consecutive_errors = 0
+
+        while elapsed < FAL_VIDEO_MAX_WAIT:
+            await asyncio.sleep(FAL_VIDEO_POLL_INTERVAL)
+            elapsed += FAL_VIDEO_POLL_INTERVAL
+
+            try:
+                status_data = await poll_fal_video_status(request_id)
+                consecutive_errors = 0
+            except Exception as e:
+                consecutive_errors += 1
+                logger.warning(
+                    f"Poll error {consecutive_errors}/{FAL_VIDEO_MAX_POLL_ERRORS} "
+                    f"for {request_id}: {e}"
+                )
+                if consecutive_errors >= FAL_VIDEO_MAX_POLL_ERRORS:
+                    raise Exception(
+                        f"Lost connection to video service after "
+                        f"{FAL_VIDEO_MAX_POLL_ERRORS} failed polls."
+                    )
+                continue
+
+            status = status_data.get("status", "IN_PROGRESS")
+            queue_position = status_data.get("queue_position")
+
+            # ── IN_QUEUE ──────────────────────────────────────────
+            if status == "IN_QUEUE":
+                if queue_position is not None and queue_position > 0:
+                    progress = max(1, 10 - queue_position)
+                else:
+                    progress = 5
+                if progress != last_progress:
+                    yield sse({
+                        "type": "video_progress",
+                        "progress": progress,
+                        "status": "queued",
+                        "message": (
+                            f"In queue (position: {queue_position})…"
+                            if queue_position else "Waiting in queue…"
+                        )
+                    })
+                    last_progress = progress
+
+            # ── IN_PROGRESS ───────────────────────────────────────
+            elif status == "IN_PROGRESS":
+                progress = min(
+                    90,
+                    10 + int((elapsed / FAL_VIDEO_MAX_WAIT) * 80)
+                )
+                if progress != last_progress:
+                    yield sse({
+                        "type": "video_progress",
+                        "progress": progress,
+                        "status": "generating",
+                        "message": "Generating video frames…"
+                    })
+                    last_progress = progress
+
+            # ── COMPLETED ─────────────────────────────────────────
+            elif status == "COMPLETED":
+                final_result = await get_fal_video_result(request_id)
+                video_url = _extract_video_url(final_result)
+
+                if not video_url:
+                    logger.error(
+                        f"fal.ai returned no video URL: {final_result}"
+                    )
+                    raise Exception(
+                        "Video completed but no URL was returned by the service."
+                    )
+
+                yield sse({
+                    "type": "video_progress",
+                    "progress": 100,
+                    "status": "complete",
+                    "message": "Video ready!"
+                })
+
+                # HTML5 video tag — renders in markdown-capable frontends
+                markdown_video = (
+                    f'\n\n<video controls autoplay muted loop playsinline '
+                    f'style="max-width:100%;border-radius:12px;'
+                    f'display:block;margin:8px 0;">'
+                    f'<source src="{video_url}" type="video/mp4">'
+                    f'Your browser does not support the video tag.'
+                    f'</video>\n'
+                )
+
+                yield sse({
+                    "type": "video_generated",
+                    "url": video_url,
+                    "prompt": prompt
+                })
+
+                result["text"] = markdown_video
+                return
+
+            # ── FAILED ────────────────────────────────────────────
+            elif status == "FAILED":
+                error_msg = (
+                    status_data.get("error")
+                    or "Video generation failed on the server side."
+                )
+                raise Exception(f"fal.ai: {error_msg}")
+
+            # Unknown status — keep polling silently
+            else:
+                logger.debug(f"Unknown fal.ai status '{status}' for {request_id}")
+
+        # ── Timeout ────────────────────────────────────────────────
+        raise Exception(
+            f"Video generation timed out after {int(FAL_VIDEO_MAX_WAIT)}s. "
+            "Please try again."
+        )
 
     except Exception as e:
         error_str = str(e)
@@ -1441,20 +1690,22 @@ Provide a comprehensive answer based on the search results above. Cite sources a
 async def root():
     return {
         "status": "running",
-        "service": "HeloxAi Lite",
+        "service": "HeloxAI Lite",
         "version": "4.2.0",
         "models": {
             "chat": GROQ_CHAT_MODEL,
             "vision": GROQ_VISION_MODEL,
             "tts": OPENAI_TTS_MODEL,
             "stt": GROQ_STT_MODEL,
-            "image": OPENAI_IMAGE_MODEL
+            "image": OPENAI_IMAGE_MODEL,
+            "video": FAL_VIDEO_MODEL
         },
         "features": [
             "chat", "code", "math", "web_search", "tts", "stt",
-            "image_generation", "video_generation", "image_analysis", "code_analysis",
-            "document_analysis", "finance", "model_routing", "mode_routing",
-            "progressive_image_streaming"
+            "image_generation", "real_video_generation",
+            "image_analysis", "code_analysis", "document_analysis",
+            "finance", "model_routing", "mode_routing",
+            "progressive_image_streaming", "progressive_video_streaming"
         ],
         "endpoints": {
             "chat": "POST /ask/universal",
@@ -1687,6 +1938,8 @@ async def ask_universal(req: Request, res: Response):
       - image_generated    : { type: "image_generated", data: "base64...", size: "...", quality: "..." }
       - image_error        : { type: "image_error", error: "..." }
       - video_generating   : { type: "video_generating" }
+      - video_status       : { type: "video_status", status: "queued|generating|complete", message: "..." }
+      - video_progress     : { type: "video_progress", progress: 0-100, status: "...", message: "..." }
       - video_generated    : { type: "video_generated", url: "...", prompt: "..." }
       - video_error        : { type: "video_error", error: "..." }
       - search_results     : { type: "search_results", html: "..." }
