@@ -66,7 +66,7 @@ app = FastAPI(
 # MODEL CONFIGURATION
 # =========================
 GROQ_CHAT_MODEL = "llama-3.3-70b-versatile"
-GROQ_VISION_MODEL = "meta-llama/llama-3.2-90b-vision-instruct"  # FIXED: Updated to the current stable instruct version
+VISION_MODEL = "gpt-4o-mini"  # FIXED: Switched to OpenAI for vision due to Groq deprecating their vision models
 GROQ_STT_MODEL = "whisper-large-v3"
 OPENAI_TTS_MODEL = "tts-1"
 OPENAI_IMAGE_MODEL = "gpt-image-1"
@@ -77,7 +77,7 @@ OPENAI_IMAGE_MODEL = "gpt-image-1"
 MODEL_ROUTING = {
     "helox": {
         "chat": GROQ_CHAT_MODEL,
-        "vision": GROQ_VISION_MODEL,
+        "vision": VISION_MODEL,
         "provider": "groq"
     },
     "chatgpt": {
@@ -87,7 +87,7 @@ MODEL_ROUTING = {
     },
     "chatz": {
         "chat": GROQ_CHAT_MODEL,
-        "vision": GROQ_VISION_MODEL,
+        "vision": VISION_MODEL,
         "provider": "groq"
     },
 }
@@ -467,7 +467,7 @@ BASE_SYSTEM_PROMPT = """You are HeloxAi, a powerful AI assistant powered by Llam
 **Identity:**
 - If asked who created you, say: "I was constructed by GoldYLocks. You can find them on Twitter @HeloxAi" """
 
-IMAGE_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, an expert visual analyst powered by Llama 3.2 90B Vision.
+IMAGE_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, an expert visual analyst.
 
 Analyze the provided image thoroughly. Cover:
 1. **Description:** What is shown in the image (objects, scene, people, text, etc.)
@@ -480,7 +480,7 @@ Be specific and precise. If the image contains code screenshots, read and explai
 If it's a diagram or chart, describe the data/trends shown.
 Use Markdown formatting for structure."""
 
-CODE_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, a senior software engineer and code reviewer powered by Llama 3.3 70B.
+CODE_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, a senior software engineer and code reviewer.
 
 Analyze the provided code thoroughly:
 
@@ -497,7 +497,7 @@ Analyze the provided code thoroughly:
 
 Be specific - reference line numbers or code sections. Provide working improved code."""
 
-DOCUMENT_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, an expert document analyst powered by Llama 3.3 70B.
+DOCUMENT_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, an expert document analyst.
 
 Analyze the provided document/file content thoroughly:
 
@@ -510,7 +510,7 @@ Analyze the provided document/file content thoroughly:
 
 Be thorough but well-organized. Use Markdown formatting."""
 
-FINANCE_SYSTEM_PROMPT = """You are HeloxAi, a financial analysis assistant powered by Llama 3.3 70B.
+FINANCE_SYSTEM_PROMPT = """You are HeloxAi, a financial analysis assistant.
 
 You have access to real-time web search for financial data. When analyzing financial topics:
 
@@ -1694,7 +1694,7 @@ async def root():
         "version": "4.2.0",
         "models": {
             "chat": GROQ_CHAT_MODEL,
-            "vision": GROQ_VISION_MODEL,
+            "vision": VISION_MODEL,
             "tts": OPENAI_TTS_MODEL,
             "stt": GROQ_STT_MODEL,
             "image": OPENAI_IMAGE_MODEL,
@@ -1879,8 +1879,9 @@ async def analyze_file(
         async def analysis_stream():
             full_response = ""
             try:
-                async for delta in stream_groq_chat(
-                    analysis_messages, model=GROQ_VISION_MODEL
+                # Switched to OpenAI for analysis to avoid Groq vision deprecation issues
+                async for delta in stream_openai_chat(
+                    analysis_messages, model=VISION_MODEL
                 ):
                     full_response += delta
                     yield sse({"type": "text_delta", "content": delta})
@@ -1909,8 +1910,8 @@ async def analyze_file(
         )
     else:
         try:
-            response_text = await groq_chat_sync(
-                analysis_messages, model=GROQ_VISION_MODEL
+            response_text = await openai_chat_sync(
+                analysis_messages, model=VISION_MODEL
             )
         except Exception as e:
             response_text = f"[Analysis error: {str(e)}]"
@@ -2435,7 +2436,7 @@ async def analyze_file_json(
             messages = _build_document_analysis_messages(file_text_content, file_filename, prompt)
 
     try:
-        response_text = await groq_chat_sync(messages, model=GROQ_VISION_MODEL)
+        response_text = await openai_chat_sync(messages, model=VISION_MODEL)
     except Exception as e:
         response_text = f"[Analysis error: {str(e)}]"
 
