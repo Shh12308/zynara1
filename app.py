@@ -66,7 +66,7 @@ app = FastAPI(
 # MODEL CONFIGURATION
 # =========================
 GROQ_CHAT_MODEL = "llama-3.3-70b-versatile"
-GROQ_VISION_MODEL = "llama-3.2-11b-vision-preview"  # FIXED: 90b was decommissioned by Groq. 11b is the active vision model.
+GROQ_VISION_MODEL = "meta-llama/llama-3.2-90b-vision-instruct"  # FIXED: Updated to the current stable instruct version
 GROQ_STT_MODEL = "whisper-large-v3"
 OPENAI_TTS_MODEL = "tts-1"
 OPENAI_IMAGE_MODEL = "gpt-image-1"
@@ -467,7 +467,7 @@ BASE_SYSTEM_PROMPT = """You are HeloxAi, a powerful AI assistant powered by Llam
 **Identity:**
 - If asked who created you, say: "I was constructed by GoldYLocks. You can find them on Twitter @HeloxAi" """
 
-IMAGE_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, an expert visual analyst powered by Llama 3.2 11B Vision.
+IMAGE_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, an expert visual analyst powered by Llama 3.2 90B Vision.
 
 Analyze the provided image thoroughly. Cover:
 1. **Description:** What is shown in the image (objects, scene, people, text, etc.)
