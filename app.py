@@ -65,9 +65,10 @@ app = FastAPI(
 # =========================
 # MODEL CONFIGURATION
 # =========================
-GROQ_CHAT_MODEL = "llama-3.3-70b-versatile"
-VISION_MODEL = "gpt-4o-mini"  # FIXED: Switched to OpenAI for vision due to Groq deprecating their vision models
-GROQ_STT_MODEL = "whisper-large-v3"
+# Switched to OpenAI for Chat and Vision to prevent Groq deprecation issues
+OPENAI_CHAT_MODEL = "gpt-4o-mini"
+OPENAI_VISION_MODEL = "gpt-4o-mini"
+GROQ_STT_MODEL = "whisper-large-v3"  # Still using Groq for Speech-to-Text
 OPENAI_TTS_MODEL = "tts-1"
 OPENAI_IMAGE_MODEL = "gpt-image-1"
 
@@ -76,9 +77,9 @@ OPENAI_IMAGE_MODEL = "gpt-image-1"
 # =========================
 MODEL_ROUTING = {
     "helox": {
-        "chat": GROQ_CHAT_MODEL,
-        "vision": VISION_MODEL,
-        "provider": "groq"
+        "chat": OPENAI_CHAT_MODEL,
+        "vision": OPENAI_VISION_MODEL,
+        "provider": "openai"
     },
     "chatgpt": {
         "chat": "gpt-4o-mini",
@@ -86,9 +87,9 @@ MODEL_ROUTING = {
         "provider": "openai"
     },
     "chatz": {
-        "chat": GROQ_CHAT_MODEL,
-        "vision": VISION_MODEL,
-        "provider": "groq"
+        "chat": OPENAI_CHAT_MODEL,
+        "vision": OPENAI_VISION_MODEL,
+        "provider": "openai"
     },
 }
 
@@ -449,7 +450,7 @@ async def create_user_session(user_id: str, remember: bool = True) -> Optional[s
 # =========================
 # SYSTEM PROMPTS
 # =========================
-BASE_SYSTEM_PROMPT = """You are HeloxAi, a powerful AI assistant powered by Llama 3.3 70B.
+BASE_SYSTEM_PROMPT = """You are HeloxAi, a powerful AI assistant.
 
 **Capabilities:**
 1. **Text & Reasoning:** Advanced understanding, reasoning, writing, and conversation.
@@ -946,7 +947,8 @@ async def perform_web_search_formatted(query: str) -> Tuple[str, str]:
 
 
 async def stream_groq_chat(messages: list, model: str = None):
-    use_model = model or GROQ_CHAT_MODEL
+    # Fallback kept just in case, but default routing no longer uses it
+    use_model = model or "llama-3.3-70b-versatile"
     attempt = 0
     while attempt < GROQ_MAX_RETRIES:
         attempt += 1
@@ -1043,7 +1045,7 @@ async def stream_openai_chat(messages: list, model: str = "gpt-4o-mini"):
 
 
 async def groq_chat_sync(messages: list, model: str = None, max_tokens: int = 4096) -> str:
-    use_model = model or GROQ_CHAT_MODEL
+    use_model = model or "llama-3.3-70b-versatile"
     attempt = 0
     while attempt < GROQ_MAX_RETRIES:
         attempt += 1
@@ -1693,8 +1695,8 @@ async def root():
         "service": "HeloxAI Lite",
         "version": "4.2.0",
         "models": {
-            "chat": GROQ_CHAT_MODEL,
-            "vision": VISION_MODEL,
+            "chat": OPENAI_CHAT_MODEL,
+            "vision": OPENAI_VISION_MODEL,
             "tts": OPENAI_TTS_MODEL,
             "stt": GROQ_STT_MODEL,
             "image": OPENAI_IMAGE_MODEL,
@@ -1879,9 +1881,9 @@ async def analyze_file(
         async def analysis_stream():
             full_response = ""
             try:
-                # Switched to OpenAI for analysis to avoid Groq vision deprecation issues
+                # Uses OpenAI vision model for analysis
                 async for delta in stream_openai_chat(
-                    analysis_messages, model=VISION_MODEL
+                    analysis_messages, model=OPENAI_VISION_MODEL
                 ):
                     full_response += delta
                     yield sse({"type": "text_delta", "content": delta})
@@ -1911,7 +1913,7 @@ async def analyze_file(
     else:
         try:
             response_text = await openai_chat_sync(
-                analysis_messages, model=VISION_MODEL
+                analysis_messages, model=OPENAI_VISION_MODEL
             )
         except Exception as e:
             response_text = f"[Analysis error: {str(e)}]"
@@ -2436,7 +2438,7 @@ async def analyze_file_json(
             messages = _build_document_analysis_messages(file_text_content, file_filename, prompt)
 
     try:
-        response_text = await openai_chat_sync(messages, model=VISION_MODEL)
+        response_text = await openai_chat_sync(messages, model=OPENAI_VISION_MODEL)
     except Exception as e:
         response_text = f"[Analysis error: {str(e)}]"
 
