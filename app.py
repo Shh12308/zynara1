@@ -59,7 +59,7 @@ GROQ_MAX_RETRIES = 3
 app = FastAPI(
     title="HeloxAI Lite",
     description="Text, Code, Math, Research, Image/Video Generation & File Analysis Backend",
-    version="4.2.0"
+    version="4.2.1" # Version bumped for frontend compatibility fix
 )
 
 # =========================
@@ -947,7 +947,6 @@ async def perform_web_search_formatted(query: str) -> Tuple[str, str]:
 
 
 async def stream_groq_chat(messages: list, model: str = None):
-    # Fallback kept just in case, but default routing no longer uses it
     use_model = model or "llama-3.3-70b-versatile"
     attempt = 0
     while attempt < GROQ_MAX_RETRIES:
@@ -1148,11 +1147,9 @@ def _extract_video_url(result: Dict[str, Any]) -> Optional[str]:
     if not result:
         return None
 
-    # {"video": {"url": "..."}}
     if isinstance(result.get("video"), dict):
         return result["video"].get("url")
 
-    # {"videos": [{"url": "..."}]} or {"videos": {"url": "..."}}
     if "videos" in result:
         vids = result["videos"]
         if isinstance(vids, list) and vids:
@@ -1160,7 +1157,6 @@ def _extract_video_url(result: Dict[str, Any]) -> Optional[str]:
         if isinstance(vids, dict):
             return vids.get("url")
 
-    # {"output": "url"} or {"output": [{"url": "..."}]}  (some legacy models)
     if "output" in result:
         out = result["output"]
         if isinstance(out, str):
@@ -1171,7 +1167,6 @@ def _extract_video_url(result: Dict[str, Any]) -> Optional[str]:
             item = out[0]
             return item.get("url") if isinstance(item, dict) else item
 
-    # {"url": "..."}
     if "url" in result:
         return result["url"]
 
@@ -1422,20 +1417,18 @@ async def _stream_video_generation(
     Writes the response text to result["text"] for DB saving.
 
     SSE events emitted:
-      - video_generating
-      - video_status     (status, message)
-      - video_progress    (progress 0-100, status, message)
-      - video_generated   (url, prompt)
-      - video_error       (error)
+      - status            (message)
+      - video             (url)
+      - text_delta        (content) [in case of error]
     """
     if not FAL_KEY:
         error_msg = "Video generation is not configured (FAL_KEY missing)."
         logger.error(error_msg)
-        yield sse({"type": "video_error", "error": error_msg})
+        yield sse({"type": "text_delta", "content": f"\n\n*Error: {error_msg}*"})
         result["text"] = f"[{error_msg}]"
         return
 
-    yield sse({"type": "video_generating"})
+    yield sse({"type": "status", "message": "Submitting video request..."})
 
     request_id: Optional[str] = None
     try:
@@ -1446,21 +1439,10 @@ async def _stream_video_generation(
             f"(model={FAL_VIDEO_MODEL})"
         )
 
-        yield sse({
-            "type": "video_status",
-            "status": "queued",
-            "message": "Request submitted — waiting in queue…"
-        })
-        yield sse({
-            "type": "video_progress",
-            "progress": 2,
-            "status": "queued",
-            "message": "Queued…"
-        })
+        yield sse({"type": "status", "message": "Waiting in queue..."})
 
         # ── Poll for status updates ─────────────────────────────────
         elapsed = 0.0
-        last_progress = 0
         consecutive_errors = 0
 
         while elapsed < FAL_VIDEO_MAX_WAIT:
@@ -1488,36 +1470,12 @@ async def _stream_video_generation(
 
             # ── IN_QUEUE ──────────────────────────────────────────
             if status == "IN_QUEUE":
-                if queue_position is not None and queue_position > 0:
-                    progress = max(1, 10 - queue_position)
-                else:
-                    progress = 5
-                if progress != last_progress:
-                    yield sse({
-                        "type": "video_progress",
-                        "progress": progress,
-                        "status": "queued",
-                        "message": (
-                            f"In queue (position: {queue_position})…"
-                            if queue_position else "Waiting in queue…"
-                        )
-                    })
-                    last_progress = progress
+                msg = f"In queue (position: {queue_position})..." if queue_position else "Waiting in queue..."
+                yield sse({"type": "status", "message": msg})
 
             # ── IN_PROGRESS ───────────────────────────────────────
             elif status == "IN_PROGRESS":
-                progress = min(
-                    90,
-                    10 + int((elapsed / FAL_VIDEO_MAX_WAIT) * 80)
-                )
-                if progress != last_progress:
-                    yield sse({
-                        "type": "video_progress",
-                        "progress": progress,
-                        "status": "generating",
-                        "message": "Generating video frames…"
-                    })
-                    last_progress = progress
+                yield sse({"type": "status", "message": "Generating video frames..."})
 
             # ── COMPLETED ─────────────────────────────────────────
             elif status == "COMPLETED":
@@ -1532,14 +1490,14 @@ async def _stream_video_generation(
                         "Video completed but no URL was returned by the service."
                     )
 
+                yield sse({"type": "status", "message": "Video ready!"})
+
+                # Frontend onMedia expects {"type": "video", "url": "..."}
                 yield sse({
-                    "type": "video_progress",
-                    "progress": 100,
-                    "status": "complete",
-                    "message": "Video ready!"
+                    "type": "video",
+                    "url": video_url
                 })
 
-                # HTML5 video tag — renders in markdown-capable frontends
                 markdown_video = (
                     f'\n\n<video controls autoplay muted loop playsinline '
                     f'style="max-width:100%;border-radius:12px;'
@@ -1548,12 +1506,6 @@ async def _stream_video_generation(
                     f'Your browser does not support the video tag.'
                     f'</video>\n'
                 )
-
-                yield sse({
-                    "type": "video_generated",
-                    "url": video_url,
-                    "prompt": prompt
-                })
 
                 result["text"] = markdown_video
                 return
@@ -1580,8 +1532,8 @@ async def _stream_video_generation(
         error_str = str(e)
         logger.error(f"Video generation stream error: {error_str}")
         yield sse({
-            "type": "video_error",
-            "error": error_str
+            "type": "text_delta",
+            "content": f"\n\n*Error: {error_str}*"
         })
         result["text"] = f"[Video generation failed: {error_str}]"
 
@@ -1693,7 +1645,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAI Lite",
-        "version": "4.2.0",
+        "version": "4.2.1",
         "models": {
             "chat": OPENAI_CHAT_MODEL,
             "vision": OPENAI_VISION_MODEL,
@@ -1940,11 +1892,8 @@ async def ask_universal(req: Request, res: Response):
       - image_progress     : { type: "image_progress", progress: 0-100, data: "base64..." }
       - image_generated    : { type: "image_generated", data: "base64...", size: "...", quality: "..." }
       - image_error        : { type: "image_error", error: "..." }
-      - video_generating   : { type: "video_generating" }
-      - video_status       : { type: "video_status", status: "queued|generating|complete", message: "..." }
-      - video_progress     : { type: "video_progress", progress: 0-100, status: "...", message: "..." }
-      - video_generated    : { type: "video_generated", url: "...", prompt: "..." }
-      - video_error        : { type: "video_error", error: "..." }
+      - status             : { type: "status", message: "..." }
+      - video              : { type: "video", url: "..." }
       - search_results     : { type: "search_results", html: "..." }
       - text_delta         : { type: "text_delta", content: "..." }
       - done               : { type: "done", conversation_id: "..." }
@@ -2274,7 +2223,10 @@ async def list_tts_voices():
     return JSONResponse({
         "voices": [
             {"id": "alloy", "name": "Alloy", "description": "Balanced and neutral"},
-            
+            {"id": "echo", "name": "Echo", "description": "Clear and focused"},
+            {"id": "fable", "name": "Fable", "description": "Warm and expressive"},
+            {"id": "onyx", "name": "Onyx", "description": "Deep and authoritative"},
+            {"id": "nova", "name": "Nova", "description": "Bright and energetic"},
             {"id": "shimmer", "name": "Shimmer", "description": "Soft and gentle"},
         ]
     })
