@@ -2223,10 +2223,7 @@ async def list_tts_voices():
     return JSONResponse({
         "voices": [
             {"id": "alloy", "name": "Alloy", "description": "Balanced and neutral"},
-            {"id": "echo", "name": "Echo", "description": "Clear and focused"},
-            {"id": "fable", "name": "Fable", "description": "Warm and expressive"},
-            {"id": "onyx", "name": "Onyx", "description": "Deep and authoritative"},
-            {"id": "nova", "name": "Nova", "description": "Bright and energetic"},
+            
             {"id": "shimmer", "name": "Shimmer", "description": "Soft and gentle"},
         ]
     })
