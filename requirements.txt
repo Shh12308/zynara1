@@ -17,7 +17,7 @@ google-genai
 uvloop[standard]
 imageio
 slowapi==0.1.5
-fitz 
+pymupdf
 
 # SUPABASE / DATABASE
 supabase==2.9.0
