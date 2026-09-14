@@ -7,6 +7,7 @@ import logging
 import time
 import base64
 import io
+import tempfile
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -57,24 +58,20 @@ GROQ_MAX_RETRIES = 3
 
 
 app = FastAPI(
-    title="HeloxAI Lite",
-    description="Text, Code, Math, Research, Image/Video Generation & File Analysis Backend",
-    version="4.2.1" # Version bumped for frontend compatibility fix
+    title="HeloxAI Pro",
+    description="Agentic AI Backend with Tools, Code Execution, Projects & Memory",
+    version="5.0.0" 
 )
 
 # =========================
 # MODEL CONFIGURATION
 # =========================
-# Switched to OpenAI for Chat and Vision to prevent Groq deprecation issues
 OPENAI_CHAT_MODEL = "gpt-4o-mini"
 OPENAI_VISION_MODEL = "gpt-4o-mini"
-GROQ_STT_MODEL = "whisper-large-v3"  # Still using Groq for Speech-to-Text
+GROQ_STT_MODEL = "whisper-large-v3"
 OPENAI_TTS_MODEL = "tts-1"
 OPENAI_IMAGE_MODEL = "gpt-image-1"
 
-# =========================
-# MODEL ROUTING
-# =========================
 MODEL_ROUTING = {
     "helox": {
         "chat": OPENAI_CHAT_MODEL,
@@ -107,8 +104,6 @@ allowed_origins = list({
     "capacitor://localhost",
 })
 
-logger.info(f"CORS Allowed Origins: {allowed_origins}")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -140,10 +135,9 @@ def _get_conv_lock(conv_id: str) -> asyncio.Lock:
         _conv_creation_locks[conv_id] = asyncio.Lock()
     return _conv_creation_locks[conv_id]
 
-# ══════════════════════════════════════════════
-# RATE LIMITING CONFIGURATION
-# ══════════════════════════════════════════════
-
+# =========================
+# RATE LIMITING
+# =========================
 IP_RATE_LIMIT = 30
 IP_RATE_WINDOW = 60
 
@@ -156,7 +150,6 @@ ENDPOINT_LIMITS = {
 
 _RATE_CLEANUP_INTERVAL = 300
 _last_rate_cleanup = 0
-
 _rate_store: Dict[str, List[float]] = {}
 
 
@@ -166,20 +159,17 @@ def _get_rate_key(client_ip: str, path: str) -> str:
             return f"{client_ip}:{ep}"
     return f"{client_ip}:__global__"
 
-
 def _get_limits_for_key(key: str) -> Tuple[int, int]:
     for ep, cfg in ENDPOINT_LIMITS.items():
         if key.endswith(ep):
             return cfg["limit"], cfg["window"]
     return IP_RATE_LIMIT, IP_RATE_WINDOW
 
-
 def _cleanup_rate_store(now: float):
     global _last_rate_cleanup
     if now - _last_rate_cleanup < _RATE_CLEANUP_INTERVAL:
         return
     _last_rate_cleanup = now
-
     stale_keys = []
     for key, timestamps in _rate_store.items():
         _, window = _get_limits_for_key(key)
@@ -188,13 +178,8 @@ def _cleanup_rate_store(now: float):
             _rate_store[key] = filtered
         else:
             stale_keys.append(key)
-
     for key in stale_keys:
         del _rate_store[key]
-
-    if stale_keys:
-        logger.debug(f"Rate store cleanup: pruned {len(stale_keys)} stale keys")
-
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
@@ -203,7 +188,6 @@ async def rate_limit_middleware(request: Request, call_next):
 
     client_ip = request.client.host if request.client else "unknown"
     now = time.time()
-
     _cleanup_rate_store(now)
 
     key = _get_rate_key(client_ip, request.url.path)
@@ -218,15 +202,9 @@ async def rate_limit_middleware(request: Request, call_next):
     if current_count >= limit:
         oldest = _rate_store[key][0]
         reset_at = int(oldest + window)
-        logger.warning(f"Rate limit hit: {key} ({current_count}/{limit})")
         return JSONResponse(
             status_code=429,
-            content={
-                "detail": "Too many requests. Please slow down.",
-                "limit": limit,
-                "window": window,
-                "reset_at": reset_at,
-            },
+            content={"detail": "Too many requests. Please slow down."},
             headers={
                 "X-RateLimit-Limit": str(limit),
                 "X-RateLimit-Remaining": "0",
@@ -247,94 +225,12 @@ async def rate_limit_middleware(request: Request, call_next):
 
     return response
 
-if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-    raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
-
-
-# =========================
-# FILE TYPES
-# =========================
-class FileCategory(Enum):
-    CODE = "code"
-    DOCUMENT = "document"
-    DATA = "data"
-    IMAGE = "image"
-    UNKNOWN = "unknown"
-
-
-CODE_EXTENSIONS = {
-    '.py', '.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.java',
-    '.c', '.cpp', '.go', '.rs', '.php', '.rb', '.swift', '.sql',
-    '.json', '.yaml', '.xml', '.h', '.hpp', '.cs', '.kt', '.dart',
-    '.lua', '.r', '.m', '.mm', '.sh', '.bash', '.zsh', '.ps1',
-    '.scala', '.clj', '.hs', '.ex', '.exs', '.erl', '.zig', '.nim',
-    '.v', '.sol', '.move', '.tf', '.hcl', '.dockerfile', '.makefile',
-    '.cmake', '.gradle', '.pom', '.csproj', '.sln', '.vue', '.svelte'
-}
-DOCUMENT_EXTENSIONS = {'.txt', '.md', '.csv', '.pdf', '.doc', '.docx', '.log', '.rtf', '.odt'}
-DATA_EXTENSIONS = {'.csv', '.json', '.xml', '.yaml', '.yml', '.tsv', '.ini', '.toml', '.env'}
-IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.tiff', '.ico'}
-
-
-def get_file_category(filename: str) -> FileCategory:
-    if not filename:
-        return FileCategory.UNKNOWN
-    ext = Path(filename).suffix.lower()
-    if ext in IMAGE_EXTENSIONS:
-        return FileCategory.IMAGE
-    if ext in CODE_EXTENSIONS:
-        return FileCategory.CODE
-    if ext in DOCUMENT_EXTENSIONS:
-        return FileCategory.DOCUMENT
-    if ext in DATA_EXTENSIONS:
-        return FileCategory.DATA
-    return FileCategory.UNKNOWN
-
-
-def get_language_from_extension(filename: str) -> str:
-    ext = Path(filename).suffix.lower()
-    lang_map = {
-        '.py': 'Python', '.js': 'JavaScript', '.ts': 'TypeScript',
-        '.jsx': 'React JSX', '.tsx': 'React TSX', '.html': 'HTML',
-        '.css': 'CSS', '.java': 'Java', '.c': 'C', '.cpp': 'C++',
-        '.go': 'Go', '.rs': 'Rust', '.php': 'PHP', '.rb': 'Ruby',
-        '.swift': 'Swift', '.sql': 'SQL', '.json': 'JSON',
-        '.yaml': 'YAML', '.yml': 'YAML', '.xml': 'XML',
-        '.h': 'C Header', '.hpp': 'C++ Header', '.cs': 'C#',
-        '.kt': 'Kotlin', '.dart': 'Dart', '.lua': 'Lua',
-        '.r': 'R', '.m': 'Objective-C', '.mm': 'Objective-C++',
-        '.sh': 'Shell', '.bash': 'Bash', '.zsh': 'Zsh',
-        '.ps1': 'PowerShell', '.scala': 'Scala', '.clj': 'Clojure',
-        '.hs': 'Haskell', '.ex': 'Elixir', '.exs': 'Elixir',
-        '.erl': 'Erlang', '.zig': 'Zig', '.nim': 'Nim',
-        '.v': 'V', '.sol': 'Solidity', '.vue': 'Vue',
-        '.svelte': 'Svelte', '.md': 'Markdown', '.txt': 'Plain Text',
-        '.csv': 'CSV', '.log': 'Log', '.dockerfile': 'Dockerfile',
-        '.makefile': 'Makefile', '.tf': 'Terraform', '.hcl': 'HCL',
-    }
-    return lang_map.get(ext, 'Unknown')
-
-
-async def extract_text_safe(content: bytes) -> str:
-    for enc in ['utf-8', 'latin-1', 'cp1252']:
-        try:
-            return content.decode(enc, errors='ignore')[:MAX_TEXT_LENGTH]
-        except Exception:
-            continue
-    return "[Binary or unreadable content]"
-
-
-def _is_image_mime(mime: str) -> bool:
-    return mime and mime.startswith("image/")
-
-
 # =========================
 # AUTH SYSTEM
 # =========================
 PRIMARY_COOKIE = "HeloxAI_Session"
 SESSION_TOKEN_COOKIE = "HeloxAI_Token"
 SESSION_EXPIRY_COOKIE = "HeloxAI_Expiry"
-
 
 def get_cookie_settings(remember: bool = True) -> Dict:
     base = {
@@ -349,11 +245,9 @@ def get_cookie_settings(remember: bool = True) -> Dict:
         base["domain"] = cookie_domain
     return base
 
-
 def generate_session_token() -> str:
     import secrets
     return secrets.token_urlsafe(64)
-
 
 def set_session_cookies(response: Response, user_id: str, token: str, remember: bool = True):
     settings = get_cookie_settings(remember)
@@ -361,7 +255,6 @@ def set_session_cookies(response: Response, user_id: str, token: str, remember: 
     response.set_cookie(key=PRIMARY_COOKIE, value=user_id, **settings)
     response.set_cookie(key=SESSION_TOKEN_COOKIE, value=token, **settings)
     response.set_cookie(key=SESSION_EXPIRY_COOKIE, value=str(expiry), **settings)
-
 
 def clear_session_cookies(response: Response):
     cookie_domain = os.getenv("COOKIE_DOMAIN")
@@ -371,13 +264,11 @@ def clear_session_cookies(response: Response):
             kwargs["domain"] = cookie_domain
         response.delete_cookie(**kwargs)
 
-
 def is_session_expired(expiry_str: str) -> bool:
     try:
         return time.time() > int(expiry_str)
     except Exception:
         return True
-
 
 async def validate_session_token(user_id: str, token: str) -> bool:
     try:
@@ -404,7 +295,6 @@ async def validate_session_token(user_id: str, token: str) -> bool:
         logger.error(f"Session validation error: {e}")
         return False
 
-
 async def ensure_user_exists(user_id: str) -> bool:
     try:
         await asyncio.to_thread(
@@ -419,10 +309,8 @@ async def ensure_user_exists(user_id: str) -> bool:
         logger.error(f"Failed to ensure user exists: {e}")
         return False
 
-
 async def create_user_session(user_id: str, remember: bool = True) -> Optional[str]:
     if not await ensure_user_exists(user_id):
-        logger.error(f"Cannot create session: failed to ensure user {user_id} exists")
         return None
 
     token = generate_session_token()
@@ -446,7 +334,6 @@ async def create_user_session(user_id: str, remember: bool = True) -> Optional[s
         logger.error(f"Failed to create session: {e}")
         return None
 
-
 # =========================
 # SYSTEM PROMPTS
 # =========================
@@ -455,61 +342,17 @@ BASE_SYSTEM_PROMPT = """You are HeloxAi, a powerful AI assistant.
 **Capabilities:**
 1. **Text & Reasoning:** Advanced understanding, reasoning, writing, and conversation.
 2. **Coding:** Expert in writing, debugging, and reviewing code across all languages.
-3. **Math:** Capable of solving mathematical problems and equations.
+3. **Math & Data Analysis:** You can write and execute Python code to solve complex math, analyze data, or generate files.
 4. **Research:** You have access to real-time web search. Use it for current events or facts.
 
 **Response Style:**
-- Use Markdown for structure (headers, bolding, code blocks with language tags, lists, tables).
+- Use Markdown for structure (headers, bolding, code blocks, lists, tables).
 - Be concise but thorough.
-- If you use web search, cite sources as [1], [2] etc. with a "Sources" section at the bottom with URLs.
-- For code, always provide complete, runnable code — never use placeholders.
+- For code execution, wrap your python code in ```python ... ``` blocks. You have the ability to execute it.
 - For math, use LaTeX notation with $...$ for inline and $$...$$ for display math.
 
 **Identity:**
 - If asked who created you, say: "I was constructed by GoldYLocks. You can find them on Twitter @HeloxAi" """
-
-IMAGE_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, an expert visual analyst.
-
-Analyze the provided image thoroughly. Cover:
-1. **Description:** What is shown in the image (objects, scene, people, text, etc.)
-2. **Details:** Notable colors, layout, style, composition, quality
-3. **Context:** What the image might be used for, its likely purpose
-4. **Text:** If there is any readable text in the image, transcribe it exactly
-5. **Issues:** Any problems, errors, or anomalies visible
-
-Be specific and precise. If the image contains code screenshots, read and explain the code.
-If it's a diagram or chart, describe the data/trends shown.
-Use Markdown formatting for structure."""
-
-CODE_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, a senior software engineer and code reviewer.
-
-Analyze the provided code thoroughly:
-
-1. **Overview:** What does this code do? What language and purpose?
-2. **Architecture:** How is it structured? Patterns used?
-3. **Quality Assessment:** Rate code quality (1-10) with justification
-4. **Issues Found:**
-   - Critical: Bugs, security vulnerabilities, crashes
-   - Warnings: Bad practices, performance issues, maintainability
-   - Suggestions: Improvements, modernizations, best practices
-5. **Security Review:** Any vulnerabilities (XSS, injection, auth issues, etc.)
-6. **Performance:** Any bottlenecks or inefficiencies
-7. **Refactored Version:** Provide an improved version of the code with fixes applied
-
-Be specific - reference line numbers or code sections. Provide working improved code."""
-
-DOCUMENT_ANALYSIS_SYSTEM_PROMPT = """You are HeloxAi, an expert document analyst.
-
-Analyze the provided document/file content thoroughly:
-
-1. **Summary:** Concise summary of the content (2-3 sentences)
-2. **Key Points:** Bullet points of the main ideas/facts
-3. **Structure:** How is the document organized?
-4. **Analysis:** Deep analysis of the content, arguments, or data
-5. **Issues:** Any errors, inconsistencies, or problems found
-6. **Recommendations:** Suggestions for improvement or next steps
-
-Be thorough but well-organized. Use Markdown formatting."""
 
 FINANCE_SYSTEM_PROMPT = """You are HeloxAi, a financial analysis assistant.
 
@@ -524,140 +367,11 @@ You have access to real-time web search for financial data. When analyzing finan
 
 Be precise with numbers. If you can't find current data, say so clearly."""
 
-
-def get_system_prompt(user_prompt: str) -> str:
-    return BASE_SYSTEM_PROMPT
-
-
-# =========================
-# INTENT DETECTION
-# =========================
-class IntentCategory(Enum):
-    CODE_GENERATION = "code_generation"
-    CODE_REVIEW = "code_review"
-    CODE_DEBUG = "code_debug"
-    MATHEMATICAL = "mathematical"
-    RESEARCH = "research"
-    IMAGE_GENERATION = "image_generation"
-    VIDEO_GENERATION = "video_generation"
-    CONVERSATION = "conversation"
-
-
-@dataclass
-class IntentResult:
-    intent: IntentCategory
-    confidence: float
-
-
-class AdvancedIntentDetector:
-    def __init__(self):
-        self.patterns = {
-            IntentCategory.CODE_GENERATION: [
-                r'\b(write|create|make)\s+(code|function|script|program)',
-                r'\bimplement\s+',
-                r'\bhow\s+to\s+code\s+'
-            ],
-            IntentCategory.CODE_DEBUG: [
-                r'\b(fix|debug|solve)\s+(this|my|the)\s+(bug|error)',
-                r'\bwhy\s+is\s+(this|it)\s+not\s+working',
-                r'\berror\s*:'
-            ],
-            IntentCategory.CODE_REVIEW: [
-                r'\b(review|refactor|improve)\s+(this|my)\s+code',
-                r'\b(is\s+this)\s+code\s+(good|clean)'
-            ],
-            IntentCategory.MATHEMATICAL: [
-                r'\b(calculate|solve|compute)\s+',
-                r'\b\d+[\+\-\*\/\^]\d+',
-                r'\bintegral|derivative|equation\b'
-            ],
-            IntentCategory.RESEARCH: [
-                r'\b(search|find|look\s+up)\s+(for|about)',
-                r'\blatest\s+news|current\s+events',
-                r'\bwho\s+is\s+(currently|now)'
-            ],
-            IntentCategory.IMAGE_GENERATION: [
-                r'\b(generate|create|make|draw|render)\s+(an?\s+)?(image|picture|photo|illustration|art|drawing|painting|sketch)',
-                r'\bimage\s+of\s+',
-                r'\bdrawing\s+of\s+',
-                r'\billustration\s+of\s+',
-                r'\bpicture\s+of\s+',
-                r'\bdraw\s+me\s+',
-                r'\bvisualize\s+',
-                r'\bcreate\s+(an?\s+)?art',
-                r'\bmake\s+(me\s+)?(an?\s+)?(image|picture|art)',
-                r'\bgenerate\s+(an?\s+)?(image|picture|art|photo)',
-                r'\brender\s+(an?\s+)?(image|scene|picture)',
-                r'\bpaint\s+(me\s+)?',
-                r'\bsketch\s+(me\s+)?',
-                r'\bdesign\s+(an?\s+)?(logo|icon|banner|thumbnail)',
-                r'\b(\w+\s+){0,3}(image|picture|art|drawing|illustration|photo|painting)\s+(of|for|showing|depicting)',
-                r'^\s*(generate|create|make|draw|render)\s+',
-            ],
-            IntentCategory.VIDEO_GENERATION: [
-                r'\b(generate|create|make|render)\s+(a?\s+)?(video|clip|animation|movie|film)',
-                r'\bvideo\s+of\s+',
-                r'\banimate\s+',
-                r'\b(\w+\s+){0,3}(video|clip|animation|movie)\s+(of|for|showing|depicting)',
-                r'^\s*(generate|create|make|render)\s+(a?\s+)?video',
-            ],
-            IntentCategory.CONVERSATION: [
-                r'^(hello|hi|hey|thanks)',
-                r'^(how\s+are\s+you)'
-            ]
-        }
-        self.compiled_patterns = {
-            intent: [re.compile(p, re.IGNORECASE) for p in patterns]
-            for intent, patterns in self.patterns.items()
-        }
-
-    def detect(self, text: str) -> IntentResult:
-        # Check Video first to prevent it falling into Image
-        for intent in [IntentCategory.VIDEO_GENERATION]:
-            patterns = self.compiled_patterns.get(intent, [])
-            matches = sum(1 for p in patterns if p.search(text))
-            if matches > 0:
-                return IntentResult(intent=intent, confidence=min(0.6 + matches * 0.1, 0.98))
-
-        for intent in [IntentCategory.IMAGE_GENERATION]:
-            patterns = self.compiled_patterns.get(intent, [])
-            matches = sum(1 for p in patterns if p.search(text))
-            if matches > 0:
-                return IntentResult(intent=intent, confidence=min(0.6 + matches * 0.1, 0.98))
-
-        for intent, patterns in self.compiled_patterns.items():
-            if intent in [IntentCategory.IMAGE_GENERATION, IntentCategory.VIDEO_GENERATION]:
-                continue
-            matches = sum(1 for p in patterns if p.search(text))
-            if matches > 0:
-                return IntentResult(intent=intent, confidence=min(0.5 + matches * 0.1, 0.95))
-        return IntentResult(intent=IntentCategory.CONVERSATION, confidence=0.5)
-
-
-_detector = AdvancedIntentDetector()
-
-
-# =========================
-# MODELS
-# =========================
-class ChatRequest(BaseModel):
-    prompt: str
-    conversation_id: Optional[str] = None
-    stream: bool = True
-    remember: bool = True
-    image_size: str = "1024x1024"
-    image_quality: str = "medium"
-    model: Optional[str] = "helox"
-    mode: Optional[str] = "general"
-
-
-class AnalysisRequest(BaseModel):
-    prompt: Optional[str] = None
-    conversation_id: Optional[str] = None
-    stream: bool = True
-    remember: bool = True
-    analysis_type: Optional[str] = None
-
+def get_system_prompt(user_prompt: str, project_instructions: str = "") -> str:
+    prompt = BASE_SYSTEM_PROMPT
+    if project_instructions:
+        prompt += f"\n\n**Project Context & Instructions:**\n{project_instructions}"
+    return prompt
 
 # =========================
 # HELPERS
@@ -665,14 +379,12 @@ class AnalysisRequest(BaseModel):
 def sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
-
 async def _execute_supabase_with_retry(query_builder):
     try:
         return await asyncio.to_thread(query_builder.execute)
     except Exception as e:
         logger.error(f"Supabase Error: {e}")
         raise
-
 
 async def get_user(req: Request, res: Response, remember: bool = True) -> Dict[str, Any]:
     global _pending_new_user_id, _new_user_created_event
@@ -689,7 +401,6 @@ async def get_user(req: Request, res: Response, remember: bool = True) -> Dict[s
 
     async with _new_user_lock:
         if _pending_new_user_id is not None:
-            logger.debug("Waiting for concurrent user creation to complete...")
             await _new_user_created_event.wait()
             _new_user_created_event.clear()
 
@@ -739,7 +450,6 @@ async def get_user(req: Request, res: Response, remember: bool = True) -> Dict[s
         logger.error(f"Unexpected error in get_user: {e}")
         raise HTTPException(500, "Failed to create user session")
 
-
 async def get_user_with_auth(req: Request, res: Response, remember: bool = True) -> Dict[str, Any]:
     auth_header = req.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
@@ -759,7 +469,6 @@ async def get_user_with_auth(req: Request, res: Response, remember: bool = True)
 
     return await get_user(req, res, remember)
 
-
 async def save_message(user_id: str, conv_id: str, role: str, content: str):
     data = {
         "id": str(uuid.uuid4()),
@@ -770,8 +479,7 @@ async def save_message(user_id: str, conv_id: str, role: str, content: str):
     }
     await _execute_supabase_with_retry(supabase.table("messages").insert(data))
 
-
-async def get_history(conv_id: str, limit: int = 4):
+async def get_history(conv_id: str, limit: int = 6):
     res = await _execute_supabase_with_retry(
         supabase.table("messages")
         .select("role, content")
@@ -781,19 +489,17 @@ async def get_history(conv_id: str, limit: int = 4):
     )
     return [{"role": m["role"], "content": m["content"]} for m in (res.data or [])]
 
-
 async def get_or_create_conversation(
     user_id: str,
     proposed_id: Optional[str],
-    title: str
+    title: str,
+    project_id: Optional[str] = None
 ) -> str:
     lock_key = proposed_id or "__new__"
     lock = _get_conv_lock(lock_key)
 
     async with lock:
         if proposed_id:
-            # Retry up to 3 times with 200ms delay to handle
-            # Supabase eventual consistency after /newchat
             for _retry in range(3):
                 check = await _execute_supabase_with_retry(
                     supabase.table("conversations")
@@ -806,19 +512,22 @@ async def get_or_create_conversation(
                     return proposed_id
                 if _retry < 2:
                     await asyncio.sleep(0.2)
-            logger.warning(f"Conversation ID {proposed_id} provided but not found in DB after retries.")
 
         new_id = str(uuid.uuid4())
         logger.info(f"Creating new conversation: {new_id}")
         now = datetime.now(timezone.utc).isoformat()
+        insert_data = {
+            "id": new_id,
+            "user_id": user_id,
+            "title": title[:50],
+            "created_at": now,
+            "updated_at": now,
+        }
+        if project_id:
+            insert_data["project_id"] = project_id
+            
         await _execute_supabase_with_retry(
-            supabase.table("conversations").insert({
-                "id": new_id,
-                "user_id": user_id,
-                "title": title[:50],
-                "created_at": now,
-                "updated_at": now,
-            })
+            supabase.table("conversations").insert(insert_data)
         )
         _conv_creation_locks.pop(lock_key, None)
         return new_id
@@ -829,21 +538,17 @@ async def get_or_create_conversation(
 def get_groq_headers():
     return {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
-
 def get_groq_headers_multipart():
     return {"Authorization": f"Bearer {GROQ_API_KEY}"}
 
-
 def get_openai_headers():
     return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-
 
 def _parse_retry_after(error_body: str) -> float:
     match = re.search(r'try again in ([\d\.]+)s', error_body)
     if match:
         return float(match.group(1)) + 0.5
     return 5.0
-
 
 async def perform_web_search_formatted(query: str) -> Tuple[str, str]:
     """Returns (context_for_ai, html_for_frontend)"""
@@ -945,7 +650,6 @@ async def perform_web_search_formatted(query: str) -> Tuple[str, str]:
         logger.error(f"Search failed: {e}")
         return "[Search failed]", ""
 
-
 async def stream_groq_chat(messages: list, model: str = None):
     use_model = model or "llama-3.3-70b-versatile"
     attempt = 0
@@ -1002,7 +706,6 @@ async def stream_groq_chat(messages: list, model: str = None):
 
     raise Exception(f"Groq rate limit exceeded after {GROQ_MAX_RETRIES} retries.")
 
-
 async def stream_openai_chat(messages: list, model: str = "gpt-4o-mini"):
     if not OPENAI_API_KEY:
         yield "[OpenAI API not configured]"
@@ -1042,7 +745,6 @@ async def stream_openai_chat(messages: list, model: str = "gpt-4o-mini"):
         except httpx.RemoteProtocolError:
             raise
 
-
 async def groq_chat_sync(messages: list, model: str = None, max_tokens: int = 4096) -> str:
     use_model = model or "llama-3.3-70b-versatile"
     attempt = 0
@@ -1067,7 +769,6 @@ async def groq_chat_sync(messages: list, model: str = None, max_tokens: int = 40
 
     raise Exception(f"Groq rate limit exceeded after {GROQ_MAX_RETRIES} retries.")
 
-
 async def openai_chat_sync(messages: list, model: str = "gpt-4o-mini", max_tokens: int = 4096) -> str:
     if not OPENAI_API_KEY:
         raise Exception("OpenAI API not configured")
@@ -1080,7 +781,6 @@ async def openai_chat_sync(messages: list, model: str = "gpt-4o-mini", max_token
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
-
 
 async def generate_image_openai_sync(
     prompt: str, size: str = "1024x1024", quality: str = "medium"
@@ -1130,33 +830,62 @@ async def generate_image_openai_sync(
                     return base64.b64encode(img_resp.content).decode()
         raise Exception("No image data in response")
 
+# =========================
+# CODE EXECUTION (Data Analysis Layer)
+# =========================
+async def execute_python_code(code: str) -> str:
+    """
+    Executes Python code in a restricted subprocess.
+    Allows the LLM to perform calculations and data analysis.
+    """
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
+            f.write(code)
+            temp_path = f.name
+            
+        process = await asyncio.create_subprocess_exec(
+            "python3", temp_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10.0)
+        
+        output = stdout.decode('utf-8', errors='ignore')
+        error = stderr.decode('utf-8', errors='ignore')
+        
+        if process.returncode != 0:
+            return f"Error during execution:\n{error}"
+        return output if output else "(No output)"
+        
+    except asyncio.TimeoutError:
+        return "Execution timed out after 10 seconds."
+    except Exception as e:
+        return f"Failed to execute code: {str(e)}"
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
-# ════════════════════════════════════════════════════════════════
-# FAL.AI REAL VIDEO GENERATION
-# ════════════════════════════════════════════════════════════════
-
+# =========================
+# FAL.AI VIDEO GENERATION
+# =========================
 def get_fal_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Key {FAL_KEY}",
         "Content-Type": "application/json",
     }
 
-
 def _extract_video_url(result: Dict[str, Any]) -> Optional[str]:
-    """Extract a video URL from a fal.ai result (handles multiple schemas)."""
     if not result:
         return None
-
     if isinstance(result.get("video"), dict):
         return result["video"].get("url")
-
     if "videos" in result:
         vids = result["videos"]
         if isinstance(vids, list) and vids:
             return vids[0].get("url") if isinstance(vids[0], dict) else None
         if isinstance(vids, dict):
             return vids.get("url")
-
     if "output" in result:
         out = result["output"]
         if isinstance(out, str):
@@ -1166,84 +895,53 @@ def _extract_video_url(result: Dict[str, Any]) -> Optional[str]:
         if isinstance(out, list) and out:
             item = out[0]
             return item.get("url") if isinstance(item, dict) else item
-
     if "url" in result:
         return result["url"]
-
     return None
 
-
 async def submit_fal_video_request(prompt: str) -> str:
-    """Submit a text-to-video request to fal.ai queue. Returns request_id."""
     if not FAL_KEY:
         raise Exception("FAL_KEY is not configured")
-
     url = f"https://queue.fal.run/{FAL_VIDEO_MODEL}"
     payload = {"prompt": prompt}
-
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, headers=get_fal_headers(), json=payload)
         if resp.status_code != 200:
-            raise Exception(
-                f"fal.ai submit failed ({resp.status_code}): {resp.text}"
-            )
+            raise Exception(f"fal.ai submit failed ({resp.status_code}): {resp.text}")
         data = resp.json()
         request_id = data.get("request_id")
         if not request_id:
             raise Exception(f"fal.ai submit returned no request_id: {data}")
         return request_id
 
-
 async def poll_fal_video_status(request_id: str) -> Dict[str, Any]:
-    url = (
-        f"https://queue.fal.run/{FAL_VIDEO_MODEL}"
-        f"/requests/{request_id}/status"
-    )
+    url = f"https://queue.fal.run/{FAL_VIDEO_MODEL}/requests/{request_id}/status"
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(url, headers=get_fal_headers())
         if resp.status_code != 200:
-            raise Exception(
-                f"fal.ai status check failed ({resp.status_code}): {resp.text}"
-            )
+            raise Exception(f"fal.ai status check failed ({resp.status_code}): {resp.text}")
         return resp.json()
 
-
 async def get_fal_video_result(request_id: str) -> Dict[str, Any]:
-    url = (
-        f"https://queue.fal.run/{FAL_VIDEO_MODEL}"
-        f"/requests/{request_id}"
-    )
+    url = f"https://queue.fal.run/{FAL_VIDEO_MODEL}/requests/{request_id}"
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(url, headers=get_fal_headers())
         if resp.status_code != 200:
-            raise Exception(
-                f"fal.ai result fetch failed ({resp.status_code}): {resp.text}"
-            )
+            raise Exception(f"fal.ai result fetch failed ({resp.status_code}): {resp.text}")
         return resp.json()
 
-
 async def cancel_fal_video_request(request_id: str):
-    """Best-effort cancellation of a fal.ai video request."""
     try:
-        url = (
-            f"https://queue.fal.run/{FAL_VIDEO_MODEL}"
-            f"/requests/{request_id}"
-        )
+        url = f"https://queue.fal.run/{FAL_VIDEO_MODEL}/requests/{request_id}"
         async with httpx.AsyncClient(timeout=10) as client:
             await client.delete(url, headers=get_fal_headers())
     except Exception as e:
         logger.warning(f"Failed to cancel fal.ai request {request_id}: {e}")
 
-
-# ════════════════════════════════════════════════════════════════
+# =========================
 # PROGRESSIVE IMAGE STREAMING
-# ════════════════════════════════════════════════════════════════
-
+# =========================
 def generate_progressive_frames(image_b64: str, steps: int = 8) -> list:
-    """
-    Convert a base64 image into multiple JPEG quality levels
-    for progressive streaming to the frontend.
-    """
     try:
         image_bytes = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(image_bytes))
@@ -1284,13 +982,10 @@ def generate_progressive_frames(image_b64: str, steps: int = 8) -> list:
         logger.error(f"Progressive frame generation failed: {e}")
         return [{"progress": 100, "data": image_b64}]
 
-
 # =========================
 # ANALYSIS HELPERS
 # =========================
-def _build_image_analysis_messages(
-    image_b64: str, mime_type: str, user_prompt: Optional[str]
-) -> list:
+def _build_image_analysis_messages(image_b64: str, mime_type: str, user_prompt: Optional[str]) -> list:
     user_content = [
         {
             "type": "image_url",
@@ -1308,14 +1003,11 @@ def _build_image_analysis_messages(
         }
     ]
     return [
-        {"role": "system", "content": IMAGE_ANALYSIS_SYSTEM_PROMPT},
+        {"role": "system", "content": BASE_SYSTEM_PROMPT},
         {"role": "user", "content": user_content}
     ]
 
-
-def _build_code_analysis_messages(
-    code_text: str, filename: str, language: str, user_prompt: Optional[str]
-) -> list:
+def _build_code_analysis_messages(code_text: str, filename: str, language: str, user_prompt: Optional[str]) -> list:
     instruction = user_prompt or f"Analyze this {language} code from the file `{filename}`."
     user_content = f"""{instruction}
 
@@ -1325,14 +1017,11 @@ def _build_code_analysis_messages(
 
 Provide a thorough code review covering: bugs, security issues, performance, style, and an improved version if needed."""
     return [
-        {"role": "system", "content": CODE_ANALYSIS_SYSTEM_PROMPT},
+        {"role": "system", "content": BASE_SYSTEM_PROMPT},
         {"role": "user", "content": user_content}
     ]
 
-
-def _build_document_analysis_messages(
-    doc_text: str, filename: str, user_prompt: Optional[str]
-) -> list:
+def _build_document_analysis_messages(doc_text: str, filename: str, user_prompt: Optional[str]) -> list:
     instruction = user_prompt or f"Analyze the content from the file `{filename}`."
     user_content = f"""{instruction}
 
@@ -1342,35 +1031,18 @@ def _build_document_analysis_messages(
 
 Provide a thorough analysis: summary, key points, structure, issues, and recommendations."""
     return [
-        {"role": "system", "content": DOCUMENT_ANALYSIS_SYSTEM_PROMPT},
+        {"role": "system", "content": BASE_SYSTEM_PROMPT},
         {"role": "user", "content": user_content}
     ]
 
-
-# ════════════════════════════════════════════════════════════════
+# =========================
 # STREAMING GENERATORS
-# ════════════════════════════════════════════════════════════════
-
-async def _stream_image_generation(
-    prompt: str,
-    size: str,
-    quality: str,
-    result: dict,
-):
-    """
-    Handle the full image generation pipeline with progressive streaming.
-    Yields SSE event strings.
-    Writes the response text to result["text"] for DB saving.
-    """
+# =========================
+async def _stream_image_generation(prompt: str, size: str, quality: str, result: dict):
     yield sse({"type": "image_generating"})
-
     try:
-        image_b64 = await generate_image_openai_sync(
-            prompt, size=size, quality=quality
-        )
-
+        image_b64 = await generate_image_openai_sync(prompt, size=size, quality=quality)
         frames = generate_progressive_frames(image_b64, steps=8)
-
         for frame in frames:
             yield sse({
                 "type": "image_progress",
@@ -1379,11 +1051,8 @@ async def _stream_image_generation(
             })
             await asyncio.sleep(0.08)
 
-        # DETERMINE MIME TYPE
         is_png = not image_b64.startswith('/9j/')
         mime = "data:image/png;base64," if is_png else "data:image/jpeg;base64,"
-        
-        # CREATE MARKDOWN IMAGE TAG TO SAVE IN DATABASE
         markdown_image = f"![Generated Image]({mime}{image_b64})"
         
         yield sse({
@@ -1406,21 +1075,7 @@ async def _stream_image_generation(
 
     return
 
-
-async def _stream_video_generation(
-    prompt: str,
-    result: dict,
-):
-    """
-    Real video generation via fal.ai with progressive status streaming.
-    Yields SSE event strings.
-    Writes the response text to result["text"] for DB saving.
-
-    SSE events emitted:
-      - status            (message)
-      - video             (url)
-      - text_delta        (content) [in case of error]
-    """
+async def _stream_video_generation(prompt: str, result: dict):
     if not FAL_KEY:
         error_msg = "Video generation is not configured (FAL_KEY missing)."
         logger.error(error_msg)
@@ -1432,16 +1087,10 @@ async def _stream_video_generation(
 
     request_id: Optional[str] = None
     try:
-        # ── Submit the request ──────────────────────────────────────
         request_id = await submit_fal_video_request(prompt)
-        logger.info(
-            f"fal.ai video request submitted: {request_id} "
-            f"(model={FAL_VIDEO_MODEL})"
-        )
-
+        logger.info(f"fal.ai video request submitted: {request_id} (model={FAL_VIDEO_MODEL})")
         yield sse({"type": "status", "message": "Waiting in queue..."})
 
-        # ── Poll for status updates ─────────────────────────────────
         elapsed = 0.0
         consecutive_errors = 0
 
@@ -1454,49 +1103,31 @@ async def _stream_video_generation(
                 consecutive_errors = 0
             except Exception as e:
                 consecutive_errors += 1
-                logger.warning(
-                    f"Poll error {consecutive_errors}/{FAL_VIDEO_MAX_POLL_ERRORS} "
-                    f"for {request_id}: {e}"
-                )
+                logger.warning(f"Poll error {consecutive_errors}/{FAL_VIDEO_MAX_POLL_ERRORS} for {request_id}: {e}")
                 if consecutive_errors >= FAL_VIDEO_MAX_POLL_ERRORS:
-                    raise Exception(
-                        f"Lost connection to video service after "
-                        f"{FAL_VIDEO_MAX_POLL_ERRORS} failed polls."
-                    )
+                    raise Exception(f"Lost connection to video service after {FAL_VIDEO_MAX_POLL_ERRORS} failed polls.")
                 continue
 
             status = status_data.get("status", "IN_PROGRESS")
             queue_position = status_data.get("queue_position")
 
-            # ── IN_QUEUE ──────────────────────────────────────────
             if status == "IN_QUEUE":
                 msg = f"In queue (position: {queue_position})..." if queue_position else "Waiting in queue..."
                 yield sse({"type": "status", "message": msg})
 
-            # ── IN_PROGRESS ───────────────────────────────────────
             elif status == "IN_PROGRESS":
                 yield sse({"type": "status", "message": "Generating video frames..."})
 
-            # ── COMPLETED ─────────────────────────────────────────
             elif status == "COMPLETED":
                 final_result = await get_fal_video_result(request_id)
                 video_url = _extract_video_url(final_result)
 
                 if not video_url:
-                    logger.error(
-                        f"fal.ai returned no video URL: {final_result}"
-                    )
-                    raise Exception(
-                        "Video completed but no URL was returned by the service."
-                    )
+                    logger.error(f"fal.ai returned no video URL: {final_result}")
+                    raise Exception("Video completed but no URL was returned by the service.")
 
                 yield sse({"type": "status", "message": "Video ready!"})
-
-                # Frontend onMedia expects {"type": "video", "url": "..."}
-                yield sse({
-                    "type": "video",
-                    "url": video_url
-                })
+                yield sse({"type": "video", "url": video_url})
 
                 markdown_video = (
                     f'\n\n<video controls autoplay muted loop playsinline '
@@ -1510,81 +1141,75 @@ async def _stream_video_generation(
                 result["text"] = markdown_video
                 return
 
-            # ── FAILED ────────────────────────────────────────────
             elif status == "FAILED":
-                error_msg = (
-                    status_data.get("error")
-                    or "Video generation failed on the server side."
-                )
+                error_msg = status_data.get("error") or "Video generation failed on the server side."
                 raise Exception(f"fal.ai: {error_msg}")
 
-            # Unknown status — keep polling silently
             else:
                 logger.debug(f"Unknown fal.ai status '{status}' for {request_id}")
 
-        # ── Timeout ────────────────────────────────────────────────
-        raise Exception(
-            f"Video generation timed out after {int(FAL_VIDEO_MAX_WAIT)}s. "
-            "Please try again."
-        )
+        raise Exception(f"Video generation timed out after {int(FAL_VIDEO_MAX_WAIT)}s. Please try again.")
 
     except Exception as e:
         error_str = str(e)
         logger.error(f"Video generation stream error: {error_str}")
-        yield sse({
-            "type": "text_delta",
-            "content": f"\n\n*Error: {error_str}*"
-        })
+        yield sse({"type": "text_delta", "content": f"\n\n*Error: {error_str}*"})
         result["text"] = f"[Video generation failed: {error_str}]"
 
     return
 
-
-async def _stream_chat_response(
+# =========================
+# AGENT LAYER (Tool Calling)
+# =========================
+async def _stream_agent_response(
     prompt: str,
     conversation_id: str,
     model_key: str,
     mode: Optional[str],
     user_id: str,
     result: dict,
+    project_instructions: str = ""
 ):
     """
-    Handle text chat with optional web search, streaming tokens.
+    Handle text chat with OpenAI Tool Calling (Agent mode).
+    The LLM can autonomously decide to search the web or execute Python code.
     """
     model_config = MODEL_ROUTING.get(model_key, MODEL_ROUTING["helox"])
     chat_model = model_config["chat"]
-    provider = model_config["provider"]
 
-    should_search = False
-    search_context = ""
-    search_html = ""
+    # Define tools available to the LLM
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web for current information, news, weather, or facts.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The search query."}
+                    },
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "execute_python_code",
+                "description": "Execute Python code to perform calculations, data analysis, or solve math problems. Print results to stdout.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "description": "The Python code to execute."}
+                    },
+                    "required": ["code"]
+                }
+            }
+        }
+    ]
 
-    intent = _detector.detect(prompt)
-    if intent.intent == IntentCategory.RESEARCH:
-        should_search = True
-    elif mode in ("research", "finance", "web"):
-        should_search = True
-    else:
-        time_keywords = [
-            'today', 'now', 'current', 'latest', 'recent',
-            '2024', '2025', 'price', 'stock', 'news',
-            'weather', 'score', 'update', 'happening'
-        ]
-        if any(kw in prompt.lower() for kw in time_keywords):
-            should_search = True
-
-    if should_search and TAVILY_API_KEY:
-        try:
-            search_context, search_html = await perform_web_search_formatted(prompt)
-            if search_html:
-                yield sse({
-                    "type": "search_results",
-                    "html": search_html
-                })
-        except Exception as e:
-            logger.error(f"Search failed in chat stream: {e}")
-
-    system_prompt = get_system_prompt(prompt)
+    system_prompt = get_system_prompt(prompt, project_instructions)
     if mode == "finance":
         system_prompt = FINANCE_SYSTEM_PROMPT
 
@@ -1596,46 +1221,84 @@ async def _stream_chat_response(
     except Exception as e:
         logger.warning(f"Failed to load history: {e}")
 
-    if (search_context
-            and search_context != "[Search API Key missing]"
-            and search_context != "[No search results found]"
-            and search_context != "[Search failed]"):
-        user_content = f"""Using these search results as context:
+    messages.append({"role": "user", "content": prompt})
 
-{search_context}
-
-User question: {prompt}
-
-Provide a comprehensive answer based on the search results above. Cite sources as [1], [2] etc."""
-    else:
-        user_content = prompt
-
-    messages.append({"role": "user", "content": user_content})
-
-    full_response = ""
-    use_model = chat_model
-    stream_fn = stream_groq_chat if provider == "groq" else stream_openai_chat
-
-    try:
-        async for delta in stream_fn(messages, model=use_model):
+    # Step 1: Non-streaming call to decide if tools are needed
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=get_openai_headers(),
+            json={
+                "model": chat_model,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "auto",
+                "max_tokens": 4096
+            }
+        )
+        
+        if resp.status_code != 200:
+            error_body = resp.text
+            logger.error(f"OpenAI Agent Error {resp.status_code}: {error_body}")
+            yield sse({"type": "text_delta", "content": f"\n\n*Error: {error_body}*"})
+            result["text"] = f"[Error: {error_body}]"
+            return
+            
+        resp_data = resp.json()
+        choice = resp_data["choices"][0]
+        message = choice["message"]
+        
+        # Step 2: If tools are called, execute them and stream the final response
+        if message.get("tool_calls"):
+            messages.append(message)
+            
+            for tool_call in message["tool_calls"]:
+                func_name = tool_call["function"]["name"]
+                try:
+                    args = json.loads(tool_call["function"]["arguments"])
+                except:
+                    args = {}
+                
+                tool_call_id = tool_call["id"]
+                
+                if func_name == "web_search":
+                    query = args.get("query", prompt)
+                    yield sse({"type": "status", "message": f"Searching the web for: {query}..."})
+                    
+                    search_context, search_html = await perform_web_search_formatted(query)
+                    if search_html:
+                        yield sse({"type": "search_results", "html": search_html})
+                        
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": func_name,
+                        "content": search_context
+                    })
+                    
+                elif func_name == "execute_python_code":
+                    code = args.get("code", "")
+                    yield sse({"type": "status", "message": "Executing Python code..."})
+                    
+                    output = await execute_python_code(code)
+                    yield sse({"type": "status", "message": "Code execution complete."})
+                    
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": func_name,
+                        "content": output
+                    })
+                    
+        # Step 3: Stream the final response back to the user
+        yield sse({"type": "status", "message": ""}) # Clear status
+        
+        full_response = ""
+        async for delta in stream_openai_chat(messages, model=chat_model):
             full_response += delta
-            yield sse({
-                "type": "text_delta",
-                "content": delta
-            })
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Chat stream error: {error_msg}")
-        if not full_response:
-            full_response = f"[Error: {error_msg}]"
-            yield sse({
-                "type": "text_delta",
-                "content": f"\n\n*Error occurred: {error_msg}*"
-            })
-
-    result["text"] = full_response
-    return
-
+            yield sse({"type": "text_delta", "content": delta})
+            
+        result["text"] = full_response
 
 # =========================
 # ENDPOINTS
@@ -1644,22 +1307,15 @@ Provide a comprehensive answer based on the search results above. Cite sources a
 async def root():
     return {
         "status": "running",
-        "service": "HeloxAI Lite",
-        "version": "4.2.1",
-        "models": {
-            "chat": OPENAI_CHAT_MODEL,
-            "vision": OPENAI_VISION_MODEL,
-            "tts": OPENAI_TTS_MODEL,
-            "stt": GROQ_STT_MODEL,
-            "image": OPENAI_IMAGE_MODEL,
-            "video": FAL_VIDEO_MODEL
-        },
+        "service": "HeloxAI Pro",
+        "version": "5.0.0",
         "features": [
             "chat", "code", "math", "web_search", "tts", "stt",
             "image_generation", "real_video_generation",
             "image_analysis", "code_analysis", "document_analysis",
             "finance", "model_routing", "mode_routing",
-            "progressive_image_streaming", "progressive_video_streaming"
+            "progressive_image_streaming", "progressive_video_streaming",
+            "agent_tool_calling", "python_code_execution", "projects_context"
         ],
         "endpoints": {
             "chat": "POST /ask/universal",
@@ -1672,10 +1328,10 @@ async def root():
             "tts": "POST /tts",
             "tts_voices": "GET /tts/voices",
             "stt": "POST /stt",
-            "logout": "POST /session/logout"
+            "logout": "POST /session/logout",
+            "projects": "GET/POST /projects"
         }
     }
-
 
 # =========================
 # USER PLAN ENDPOINT
@@ -1727,7 +1383,6 @@ async def get_user_plan(req: Request):
         logger.error(f"Plan endpoint error: {e}")
         return {"plan": "free", "is_premium": False, "is_lifetime": False}
 
-
 # =========================
 # ANALYSIS ENDPOINT (MULTIPART)
 # =========================
@@ -1750,14 +1405,14 @@ async def analyze_file(
     image_mime_type = image_mime or "image/png"
     file_text_content = None
     file_filename = "unknown"
-    file_category = FileCategory.UNKNOWN
+    file_category = None
 
     if image_base64:
         clean_b64 = image_base64
         if "," in image_base64:
             clean_b64 = image_base64.split(",", 1)[1]
         image_data_b64 = clean_b64.strip()
-        file_category = FileCategory.IMAGE
+        file_category = "IMAGE"
         logger.info(f"Analysis: received base64 image ({len(image_data_b64)} chars)")
 
     elif file and file.filename:
@@ -1766,77 +1421,56 @@ async def analyze_file(
         while chunk := await file.read(1024 * 1024):
             content_bytes += chunk
             if len(content_bytes) > MAX_FILE_SIZE:
-                raise HTTPException(
-                    413,
-                    f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB."
-                )
+                raise HTTPException(413, f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB.")
 
         if len(content_bytes) == 0:
             raise HTTPException(400, "Empty file uploaded.")
 
         if analysis_type and analysis_type != "auto":
-            try:
-                file_category = FileCategory(analysis_type)
-            except ValueError:
-                file_category = get_file_category(file_filename)
+            file_category = analysis_type.upper()
         else:
-            file_category = get_file_category(file_filename)
+            ext = Path(file_filename).suffix.lower()
+            if ext in IMAGE_EXTENSIONS:
+                file_category = "IMAGE"
+            elif ext in CODE_EXTENSIONS:
+                file_category = "CODE"
+            else:
+                file_category = "DOCUMENT"
 
         if file.content_type and _is_image_mime(file.content_type):
-            file_category = FileCategory.IMAGE
+            file_category = "IMAGE"
 
-        if file_category == FileCategory.IMAGE:
+        if file_category == "IMAGE":
             image_data_b64 = base64.b64encode(content_bytes).decode()
             image_mime_type = file.content_type or "image/png"
             logger.info(f"Analysis: uploaded image file: {file_filename}")
         else:
             file_text_content = await extract_text_safe(content_bytes)
-            if (not file_text_content.strip()
-                    or file_text_content.strip() == "[Binary or unreadable content]"):
-                raise HTTPException(
-                    400,
-                    f"Could not extract text from file: {file_filename}. "
-                    "For images, ensure the file is a valid image format."
-                )
-            logger.info(
-                f"Analysis: uploaded {file_category.value} file: "
-                f"{file_filename} ({len(file_text_content)} chars)"
-            )
+            if not file_text_content.strip() or file_text_content.strip() == "[Binary or unreadable content]":
+                raise HTTPException(400, f"Could not extract text from file: {file_filename}.")
+            logger.info(f"Analysis: uploaded {file_category} file: {file_filename} ({len(file_text_content)} chars)")
     else:
         raise HTTPException(400, "Either 'file' or 'image_base64' must be provided.")
 
-    conv_id = await get_or_create_conversation(
-        user["id"],
-        conversation_id,
-        f"Analysis: {file_filename}" if file_filename else "Image Analysis"
-    )
+    conv_id = await get_or_create_conversation(user["id"], conversation_id, f"Analysis: {file_filename}" if file_filename else "Image Analysis")
 
     user_msg_content = prompt or f"[Uploaded {file_filename} for analysis]"
     await save_message(user["id"], conv_id, "user", user_msg_content)
 
-    if file_category == FileCategory.IMAGE:
-        analysis_messages = _build_image_analysis_messages(
-            image_data_b64, image_mime_type, prompt
-        )
+    if file_category == "IMAGE":
+        analysis_messages = _build_image_analysis_messages(image_data_b64, image_mime_type, prompt)
     else:
         language = get_language_from_extension(file_filename)
-        if file_category == FileCategory.CODE:
-            analysis_messages = _build_code_analysis_messages(
-                file_text_content, file_filename, language, prompt
-            )
+        if file_category == "CODE":
+            analysis_messages = _build_code_analysis_messages(file_text_content, file_filename, language, prompt)
         else:
-            analysis_messages = _build_document_analysis_messages(
-                file_text_content, file_filename, prompt
-            )
+            analysis_messages = _build_document_analysis_messages(file_text_content, file_filename, prompt)
 
     if stream:
         async def analysis_stream():
             full_response = ""
             try:
-                # Uses OpenAI vision model for analysis
-                async for delta in stream_openai_chat(
-                    analysis_messages, model=OPENAI_VISION_MODEL
-                ):
+                async for delta in stream_openai_chat(analysis_messages, model=OPENAI_VISION_MODEL):
                     full_response += delta
                     yield sse({"type": "text_delta", "content": delta})
             except Exception as e:
@@ -1864,9 +1498,7 @@ async def analyze_file(
         )
     else:
         try:
-            response_text = await openai_chat_sync(
-                analysis_messages, model=OPENAI_VISION_MODEL
-            )
+            response_text = await openai_chat_sync(analysis_messages, model=OPENAI_VISION_MODEL)
         except Exception as e:
             response_text = f"[Analysis error: {str(e)}]"
 
@@ -1877,16 +1509,13 @@ async def analyze_file(
             "conversation_id": conv_id
         })
 
-
-# ════════════════════════════════════════════════════════════════
-# MAIN CHAT ENDPOINT — WITH PROGRESSIVE IMAGE/VIDEO STREAMING
-# ════════════════════════════════════════════════════════════════
-
+# =========================
+# MAIN CHAT ENDPOINT (Agent Mode)
+# =========================
 @app.post("/ask/universal")
 async def ask_universal(req: Request, res: Response):
     """
-    Universal chat endpoint.
-
+    Universal chat endpoint with Agent Layer.
     SSE Event Types:
       - image_generating   : { type: "image_generating" }
       - image_progress     : { type: "image_progress", progress: 0-100, data: "base64..." }
@@ -1913,127 +1542,106 @@ async def ask_universal(req: Request, res: Response):
     image_quality = body.get("image_quality", "medium")
     model_key = body.get("model", "helox") or "helox"
     mode = body.get("mode", "general")
+    project_id = body.get("project_id")
 
     user = await get_user_with_auth(req, res, remember)
     user_id = user["id"]
 
+    # Fetch project context if provided
+    project_instructions = ""
+    if project_id:
+        try:
+            proj_res = await _execute_supabase_with_retry(
+                supabase.table("projects")
+                .select("instructions")
+                .eq("id", project_id)
+                .eq("user_id", user_id)
+                .limit(1)
+            )
+            if proj_res.data:
+                project_instructions = proj_res.data[0].get("instructions", "")
+        except Exception as e:
+            logger.error(f"Failed to fetch project context: {e}")
+
     title = prompt[:50] if len(prompt) > 10 else prompt
-    conv_id = await get_or_create_conversation(user_id, conversation_id, title)
+    conv_id = await get_or_create_conversation(user_id, conversation_id, title, project_id)
 
     await save_message(user_id, conv_id, "user", prompt)
 
-    intent = _detector.detect(prompt)
-
-    # ── VIDEO GENERATION PATH ──
-    if intent.intent == IntentCategory.VIDEO_GENERATION:
-        async def video_stream():
-            result = {}
-
-            async for event in _stream_video_generation(
-                prompt=prompt,
-                result=result,
-            ):
-                yield event
-
-            text_response = (
-                f"\n\nHere's the video I generated based on your request: "
-                f"*\"{prompt[:100]}{'...' if len(prompt) > 100 else ''}\"*"
-            )
-            for char in text_response:
-                yield sse({"type": "text_delta", "content": char})
-
-            full_text = result.get("text", "") + text_response
-
-            try:
-                await save_message(user_id, conv_id, "assistant", full_text)
-            except Exception as e:
-                logger.error(f"Failed to save video response: {e}")
-
-            yield sse({"type": "done", "conversation_id": conv_id})
-
-        return StreamingResponse(
-            video_stream(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            }
-        )
-
-    # ── IMAGE GENERATION PATH ──
-    if intent.intent == IntentCategory.IMAGE_GENERATION:
+    # Explicit image/video generation routes
+    if "generate image" in prompt.lower() or "create image" in prompt.lower():
         async def image_stream():
             result = {}
-
-            async for event in _stream_image_generation(
-                prompt=prompt,
-                size=image_size,
-                quality=image_quality,
-                result=result,
-            ):
+            async for event in _stream_image_generation(prompt=prompt, size=image_size, quality=image_quality, result=result):
                 yield event
-
-            text_response = (
-                f"\n\nHere's the image I generated based on your request: "
-                f"*\"{prompt[:100]}{'...' if len(prompt) > 100 else ''}\"*"
-            )
+            text_response = f"\n\nHere's the image I generated based on your request: *\"{prompt[:100]}{'...' if len(prompt) > 100 else ''}\"*"
             for char in text_response:
                 yield sse({"type": "text_delta", "content": char})
-
             full_text = result.get("text", "") + text_response
-
             try:
                 await save_message(user_id, conv_id, "assistant", full_text)
             except Exception as e:
                 logger.error(f"Failed to save image response: {e}")
-
             yield sse({"type": "done", "conversation_id": conv_id})
 
         return StreamingResponse(
             image_stream(),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            }
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no",}
         )
 
-    # ── TEXT CHAT PATH ──
-    else:
-        async def chat_stream():
+    if "generate video" in prompt.lower() or "create video" in prompt.lower():
+        async def video_stream():
             result = {}
-
-            async for event in _stream_chat_response(
-                prompt=prompt,
-                conversation_id=conv_id,
-                model_key=model_key,
-                mode=mode,
-                user_id=user_id,
-                result=result,
-            ):
+            async for event in _stream_video_generation(prompt=prompt, result=result):
                 yield event
-
-            full_response = result.get("text", "")
-
+            text_response = f"\n\nHere's the video I generated based on your request: *\"{prompt[:100]}{'...' if len(prompt) > 100 else ''}\"*"
+            for char in text_response:
+                yield sse({"type": "text_delta", "content": char})
+            full_text = result.get("text", "") + text_response
             try:
-                await save_message(user_id, conv_id, "assistant", full_response)
+                await save_message(user_id, conv_id, "assistant", full_text)
             except Exception as e:
-                logger.error(f"Failed to save chat response: {e}")
-
+                logger.error(f"Failed to save video response: {e}")
             yield sse({"type": "done", "conversation_id": conv_id})
 
         return StreamingResponse(
-            chat_stream(),
+            video_stream(),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            }
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no",}
         )
 
+    # Default: Agent Chat Path (Tool Calling)
+    async def chat_stream():
+        result = {}
+        async for event in _stream_agent_response(
+            prompt=prompt,
+            conversation_id=conv_id,
+            model_key=model_key,
+            mode=mode,
+            user_id=user_id,
+            result=result,
+            project_instructions=project_instructions
+        ):
+            yield event
+
+        full_response = result.get("text", "")
+        try:
+            await save_message(user_id, conv_id, "assistant", full_response)
+        except Exception as e:
+            logger.error(f"Failed to save chat response: {e}")
+
+        yield sse({"type": "done", "conversation_id": conv_id})
+
+    return StreamingResponse(
+        chat_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
 
 # =========================
 # NEW CHAT ENDPOINT
@@ -2047,24 +1655,76 @@ async def new_chat(req: Request, res: Response):
         body = {}
 
     title = body.get("title", "New Chat")[:50]
+    project_id = body.get("project_id")
     new_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
+    insert_data = {
+        "id": new_id,
+        "user_id": user["id"],
+        "title": title,
+        "created_at": now,
+        "updated_at": now,
+    }
+    if project_id:
+        insert_data["project_id"] = project_id
+
     try:
         await _execute_supabase_with_retry(
-            supabase.table("conversations").insert({
-                "id": new_id,
-                "user_id": user["id"],
-                "title": title,
-                "created_at": now,
-                "updated_at": now,
-            })
+            supabase.table("conversations").insert(insert_data)
         )
         return JSONResponse({"id": new_id, "title": title})
     except Exception as e:
         logger.error(f"Failed to create chat: {e}")
         raise HTTPException(500, "Failed to create chat")
 
+# =========================
+# PROJECTS API (Context Layer)
+# =========================
+@app.post("/projects")
+async def create_project(req: Request, res: Response):
+    user = await get_user_with_auth(req, res)
+    try:
+        body = await req.json()
+    except:
+        body = {}
+        
+    title = body.get("title", "New Project")
+    instructions = body.get("instructions", "")
+    
+    new_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    
+    try:
+        await _execute_supabase_with_retry(
+            supabase.table("projects").insert({
+                "id": new_id,
+                "user_id": user["id"],
+                "title": title,
+                "instructions": instructions,
+                "created_at": now,
+                "updated_at": now,
+            })
+        )
+        return JSONResponse({"id": new_id, "title": title})
+    except Exception as e:
+        logger.error(f"Failed to create project: {e}")
+        raise HTTPException(500, "Failed to create project")
+
+@app.get("/projects")
+async def list_projects(req: Request, res: Response):
+    user = await get_user_with_auth(req, res)
+    try:
+        result = await _execute_supabase_with_retry(
+            supabase.table("projects")
+            .select("id, title, instructions, created_at, updated_at")
+            .eq("user_id", user["id"])
+            .order("updated_at", desc=True)
+        )
+        return JSONResponse({"projects": result.data or []})
+    except Exception as e:
+        logger.error(f"Failed to list projects: {e}")
+        raise HTTPException(500, "Failed to list projects")
 
 # =========================
 # LIST CHATS
@@ -2084,7 +1744,6 @@ async def list_chats(req: Request, res: Response):
     except Exception as e:
         logger.error(f"Failed to list chats: {e}")
         raise HTTPException(500, "Failed to list chats")
-
 
 # =========================
 # DELETE CHAT
@@ -2125,7 +1784,6 @@ async def delete_chat(chat_id: str, req: Request, res: Response):
         logger.error(f"Failed to delete chat: {e}")
         raise HTTPException(500, "Failed to delete chat")
 
-
 # =========================
 # GET MESSAGES
 # =========================
@@ -2160,7 +1818,6 @@ async def get_messages(conversation_id: str, req: Request, res: Response):
     except Exception as e:
         logger.error(f"Failed to get messages: {e}")
         raise HTTPException(500, "Failed to get messages")
-
 
 # =========================
 # TTS ENDPOINT
@@ -2217,17 +1874,14 @@ async def text_to_speech(req: Request, res: Response):
         logger.error(f"TTS failed: {e}")
         raise HTTPException(500, "TTS generation failed")
 
-
 @app.get("/tts/voices")
 async def list_tts_voices():
     return JSONResponse({
         "voices": [
             {"id": "alloy", "name": "Alloy", "description": "Balanced and neutral"},
-            
             {"id": "shimmer", "name": "Shimmer", "description": "Soft and gentle"},
         ]
     })
-
 
 # =========================
 # STT ENDPOINT
@@ -2279,7 +1933,6 @@ async def speech_to_text(
         logger.error(f"STT failed: {e}")
         raise HTTPException(500, "Speech transcription failed")
 
-
 # =========================
 # LOGOUT ENDPOINT
 # =========================
@@ -2305,92 +1958,21 @@ async def logout(req: Request, res: Response):
     clear_session_cookies(res)
     return JSONResponse({"logged_out": True})
 
-
 # =========================
-# ANALYSIS JSON ENDPOINT (non-streaming)
+# AUTOMATION ENDPOINT (Placeholder)
 # =========================
-@app.post("/analysis/json")
-async def analyze_file_json(
-    req: Request,
-    res: Response,
-    file: Optional[UploadFile] = File(None),
-    prompt: Optional[str] = Form(None),
-    conversation_id: Optional[str] = Form(None),
-    analysis_type: Optional[str] = Form(None),
-    image_base64: Optional[str] = Form(None),
-    image_mime: Optional[str] = Form("image/png"),
-):
+@app.post("/automations")
+async def create_automation(req: Request, res: Response):
     user = await get_user_with_auth(req, res)
-
-    image_data_b64 = None
-    image_mime_type = image_mime or "image/png"
-    file_text_content = None
-    file_filename = "unknown"
-    file_category = FileCategory.UNKNOWN
-
-    if image_base64:
-        clean_b64 = image_base64
-        if "," in image_base64:
-            clean_b64 = image_base64.split(",", 1)[1]
-        image_data_b64 = clean_b64.strip()
-        file_category = FileCategory.IMAGE
-    elif file and file.filename:
-        file_filename = file.filename
-        content_bytes = b""
-        while chunk := await file.read(1024 * 1024):
-            content_bytes += chunk
-            if len(content_bytes) > MAX_FILE_SIZE:
-                raise HTTPException(413, "File too large")
-
-        if not content_bytes:
-            raise HTTPException(400, "Empty file")
-
-        if analysis_type and analysis_type != "auto":
-            try:
-                file_category = FileCategory(analysis_type)
-            except ValueError:
-                file_category = get_file_category(file_filename)
-        else:
-            file_category = get_file_category(file_filename)
-
-        if file.content_type and _is_image_mime(file.content_type):
-            file_category = FileCategory.IMAGE
-
-        if file_category == FileCategory.IMAGE:
-            image_data_b64 = base64.b64encode(content_bytes).decode()
-            image_mime_type = file.content_type or "image/png"
-        else:
-            file_text_content = await extract_text_safe(content_bytes)
-            if not file_text_content.strip() or file_text_content.strip() == "[Binary or unreadable content]":
-                raise HTTPException(400, f"Could not extract text from: {file_filename}")
-    else:
-        raise HTTPException(400, "Either 'file' or 'image_base64' required")
-
-    conv_id = await get_or_create_conversation(
-        user["id"], conversation_id,
-        f"Analysis: {file_filename}" if file_filename else "Image Analysis"
-    )
-
-    user_msg = prompt or f"[Uploaded {file_filename} for analysis]"
-    await save_message(user["id"], conv_id, "user", user_msg)
-
-    if file_category == FileCategory.IMAGE:
-        messages = _build_image_analysis_messages(image_data_b64, image_mime_type, prompt)
-    else:
-        language = get_language_from_extension(file_filename)
-        if file_category == FileCategory.CODE:
-            messages = _build_code_analysis_messages(file_text_content, file_filename, language, prompt)
-        else:
-            messages = _build_document_analysis_messages(file_text_content, file_filename, prompt)
-
     try:
-        response_text = await openai_chat_sync(messages, model=OPENAI_VISION_MODEL)
-    except Exception as e:
-        response_text = f"[Analysis error: {str(e)}]"
-
-    await save_message(user["id"], conv_id, "assistant", response_text)
-
+        body = await req.json()
+    except:
+        body = {}
+        
+    # In a real implementation, you would save this to a DB and use a scheduler (e.g., Celery, APScheduler)
+    # to run the prompt at the specified time.
+    
     return JSONResponse({
-        "response": response_text,
-        "conversation_id": conv_id
+        "status": "received", 
+        "message": "Automation scheduling is not yet fully implemented."
     })
