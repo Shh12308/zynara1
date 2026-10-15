@@ -1303,8 +1303,40 @@ def _build_code_analysis_messages(
 
     user_content = f"""{instruction}
 
+Filename: {filename}
+Language: {language}
+
 ```{language.lower()}
 {code_text}
+```"""
+
+    return [
+        {"role": "system", "content": BASE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _build_document_analysis_messages(
+    document_text: str,
+    filename: str,
+    user_prompt: Optional[str],
+) -> list:
+    instruction = user_prompt or (
+        f"Analyze the document `{filename}`. "
+        "Summarize its key points, explain important details, "
+        "and identify significant issues or conclusions."
+    )
+
+    user_content = (
+        f"{instruction}\n\n"
+        f"Document: {filename}\n\n"
+        f"Document contents:\n{document_text[:MAX_TEXT_LENGTH]}"
+    )
+
+    return [
+        {"role": "system", "content": BASE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
 
 # =========================
 # STREAMING GENERATORS
@@ -1678,59 +1710,51 @@ async def analyze_file(
     file_filename = "unknown"
     file_category = None
 
-    if image_base64:
-        clean_b64 = image_base64
-        if "," in image_base64:
-            clean_b64 = image_base64.split(",", 1)[1]
-        image_data_b64 = clean_b64.strip()
+        if image_base64:
         file_category = "IMAGE"
-        logger.info(f"Analysis: received base64 image ({len(image_data_b64)} chars)")
+        file_filename = file_filename or "uploaded_image.png"
 
     elif file and file.filename:
         file_filename = file.filename
-        content_bytes = b""
-        while chunk := await file.read(1024 * 1024):
-            content_bytes += chunk
-            if len(content_bytes) > MAX_FILE_SIZE:
-                raise HTTPException(413, f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB.")
-
-        if len(content_bytes) == 0:
-            raise HTTPException(400, "Empty file uploaded.")
-
+        ext = Path(file_filename).suffix.lower()
         requested_type = (analysis_type or "auto").strip().upper()
 
-if requested_type not in {"AUTO", "IMAGE", "CODE", "DOCUMENT"}:
-    raise HTTPException(
-        status_code=400,
-        detail="analysis_type must be auto, IMAGE, CODE, or DOCUMENT.",
-    )
+        if requested_type not in {"AUTO", "IMAGE", "CODE", "DOCUMENT"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid analysis_type. Use AUTO, IMAGE, CODE, or DOCUMENT.",
+            )
 
-if requested_type != "AUTO":
-    file_category = requested_type
-else:
-    ext = Path(file_filename).suffix.lower()
-
-    if ext in IMAGE_EXTENSIONS:
-        file_category = "IMAGE"
-    elif ext in CODE_EXTENSIONS:
-        file_category = "CODE"
-    else:
-        file_category = "DOCUMENT"
-        if file.content_type and _is_image_mime(file.content_type):
-            file_category = "IMAGE"
+        if requested_type != "AUTO":
+            file_category = requested_type
+        else:
+            if ext in IMAGE_EXTENSIONS or _is_image_mime(file.content_type):
+                file_category = "IMAGE"
+            elif ext in CODE_EXTENSIONS:
+                file_category = "CODE"
+            elif ext in DOCUMENT_EXTENSIONS:
+                file_category = "DOCUMENT"
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported file type: {ext or 'unknown'}",
+                )
 
         if file_category == "IMAGE":
-            image_data_b64 = base64.b64encode(content_bytes).decode()
-            image_mime_type = file.content_type or "image/png"
-            logger.info(f"Analysis: uploaded image file: {file_filename}")
-        else:
-            file_text_content = await extract_text_safe(content_bytes)
-            if not file_text_content.strip() or file_text_content.strip() == "[Binary or unreadable content]":
-                raise HTTPException(400, f"Could not extract text from file: {file_filename}.")
-            logger.info(f"Analysis: uploaded {file_category} file: {file_filename} ({len(file_text_content)} chars)")
-    else:
-        raise HTTPException(400, "Either 'file' or 'image_base64' must be provided.")
+            if (
+                not _is_image_mime(file.content_type)
+                and ext not in IMAGE_EXTENSIONS
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="The uploaded file does not appear to be a supported image.",
+                )
 
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Either 'file' or 'image_base64' must be provided.",
+        )
     conv_id = await get_or_create_conversation(user["id"], conversation_id, f"Analysis: {file_filename}" if file_filename else "Image Analysis")
 
     user_msg_content = prompt or f"[Uploaded {file_filename} for analysis]"
