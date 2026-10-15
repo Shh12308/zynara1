@@ -1689,6 +1689,9 @@ async def get_user_plan(req: Request):
 # =========================
 # ANALYSIS ENDPOINT (MULTIPART)
 # =========================
+# =========================
+# ANALYSIS ENDPOINT (MULTIPART)
+# =========================
 @app.post("/analysis")
 async def analyze_file(
     req: Request,
@@ -1710,118 +1713,278 @@ async def analyze_file(
     file_filename = "unknown"
     file_category = None
 
-        if image_base64:
+    # Validate the requested analysis type.
+    requested_type = (analysis_type or "AUTO").strip().upper()
+    if requested_type not in {"AUTO", "IMAGE", "CODE", "DOCUMENT"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid analysis_type. Use AUTO, IMAGE, CODE, or DOCUMENT.",
+        )
 
+    # Handle an image supplied as base64.
+    if image_base64:
         file_category = "IMAGE"
+        file_filename = "uploaded_image.png"
 
-        file_filename = file_filename or "uploaded_image.png"
+        raw_image = image_base64.strip()
 
-    elif file and file.filename:
+        # Support data URLs such as data:image/png;base64,....
+        if raw_image.startswith("data:"):
+            try:
+                header, raw_image = raw_image.split(",", 1)
+                if ";base64" not in header.lower():
+                    raise ValueError("Image data URL must use base64 encoding.")
+                detected_mime = header[5:].split(";")[0].strip()
+                if detected_mime:
+                    image_mime_type = detected_mime
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid image data URL: {exc}",
+                )
 
-        file_filename = file.filename
-
-        ext = Path(file_filename).suffix.lower()
-
-        requested_type = (analysis_type or "auto").strip().upper()
-
-        if requested_type not in {"AUTO", "IMAGE", "CODE", "DOCUMENT"}:
-
+        try:
+            decoded_image = base64.b64decode(raw_image, validate=True)
+        except Exception:
             raise HTTPException(
-
                 status_code=400,
-
-                detail="Invalid analysis_type. Use AUTO, IMAGE, CODE, or DOCUMENT.",
-
+                detail="Invalid base64 image data.",
             )
 
-        if requested_type != "AUTO":
+        if not decoded_image:
+            raise HTTPException(
+                status_code=400,
+                detail="The supplied image is empty.",
+            )
 
+        if len(decoded_image) > MAX_IMAGE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail="Image is too large.",
+            )
+
+        # Verify that the data is a readable image.
+        try:
+            with Image.open(io.BytesIO(decoded_image)) as img:
+                img.verify()
+                actual_format = img.format
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="The supplied data is not a valid supported image.",
+            )
+
+        format_mime = {
+            "PNG": "image/png",
+            "JPEG": "image/jpeg",
+            "GIF": "image/gif",
+            "WEBP": "image/webp",
+            "BMP": "image/bmp",
+            "TIFF": "image/tiff",
+        }
+
+        actual_mime = format_mime.get(actual_format)
+        if not actual_mime:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported image format.",
+            )
+
+        image_mime_type = actual_mime
+        image_data_b64 = base64.b64encode(decoded_image).decode("ascii")
+
+        if actual_format == "JPEG":
+            file_filename = "uploaded_image.jpg"
+        elif actual_format:
+            file_filename = f"uploaded_image.{actual_format.lower()}"
+
+    # Handle a multipart file upload.
+    elif file and file.filename:
+        file_filename = Path(file.filename).name
+        ext = Path(file_filename).suffix.lower()
+
+        if requested_type == "AUTO":
+            if ext in IMAGE_EXTENSIONS or _is_image_mime(file.content_type):
+                file_category = "IMAGE"
+            elif ext in CODE_EXTENSIONS:
+                file_category = "CODE"
+            elif ext in TEXT_EXTENSIONS:
+                file_category = "DOCUMENT"
+            elif ext in {
+                ".pdf", ".docx", ".xlsx", ".pptx",
+                ".odt", ".ods", ".odp",
+            }:
+                file_category = "DOCUMENT"
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Unsupported file type: {ext or 'unknown'}. "
+                        "Specify IMAGE, CODE, or DOCUMENT if appropriate."
+                    ),
+                )
+        else:
             file_category = requested_type
 
-        elif ext in IMAGE_EXTENSIONS or _is_image_mime(file.content_type):
+        # Read the upload with a size limit.
+        content_bytes = await file.read(MAX_FILE_SIZE + 1)
 
-            if image_base64:
-
-        file_category = "IMAGE"
-
-        elif ext in CODE_EXTENSIONS:
-
-            file_category = "CODE"
-
-        elif ext in DOCUMENT_EXTENSIONS:
-
-            file_category = "DOCUMENT"
-
-        else:
-
+        if not content_bytes:
             raise HTTPException(
-
                 status_code=400,
+                detail="The uploaded file is empty.",
+            )
 
-                detail=f"Unsupported file type: {ext or 'unknown'}",
-
+        if len(content_bytes) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail="File is too large. Maximum size is 20 MB.",
             )
 
         if file_category == "IMAGE":
-
-            if (
-
-                not _is_image_mime(file.content_type)
-
-                and ext not in IMAGE_EXTENSIONS
-
+            if ext not in IMAGE_EXTENSIONS and not _is_image_mime(
+                file.content_type
             ):
-
                 raise HTTPException(
-
                     status_code=400,
+                    detail="The uploaded file does not appear to be an image.",
+                )
 
-                    detail="The uploaded file does not appear to be a supported image.",
+            try:
+                with Image.open(io.BytesIO(content_bytes)) as img:
+                    img.verify()
+                    actual_format = img.format
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail="The uploaded image is invalid or unsupported.",
+                )
 
+            format_mime = {
+                "PNG": "image/png",
+                "JPEG": "image/jpeg",
+                "GIF": "image/gif",
+                "WEBP": "image/webp",
+                "BMP": "image/bmp",
+                "TIFF": "image/tiff",
+            }
+
+            image_mime_type = format_mime.get(actual_format)
+            if not image_mime_type:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unsupported image format.",
+                )
+
+            image_data_b64 = base64.b64encode(content_bytes).decode("ascii")
+
+        else:
+            file_text_content = await extract_text_safe(content_bytes)
+
+            if not file_text_content or not file_text_content.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail="No readable text could be extracted from this file.",
+                )
+
+            if file_text_content.startswith("[Binary or unreadable content]"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Could not extract readable text from this file. "
+                        "Check that its format is supported."
+                    ),
                 )
 
     else:
-
         raise HTTPException(
-
             status_code=400,
-
             detail="Either 'file' or 'image_base64' must be provided.",
-)
-    conv_id = await get_or_create_conversation(user["id"], conversation_id, f"Analysis: {file_filename}" if file_filename else "Image Analysis")
+        )
+
+    # Create or reuse the conversation.
+    title = f"Analysis: {file_filename}"
+    conv_id = await get_or_create_conversation(
+        user["id"],
+        conversation_id,
+        title,
+    )
 
     user_msg_content = prompt or f"[Uploaded {file_filename} for analysis]"
-    await save_message(user["id"], conv_id, "user", user_msg_content)
 
+    await save_message(
+        user["id"],
+        conv_id,
+        "user",
+        user_msg_content,
+    )
+
+    # Build the correct prompt for the selected content type.
     if file_category == "IMAGE":
-        analysis_messages = _build_image_analysis_messages(image_data_b64, image_mime_type, prompt)
-    else:
-        language = get_language_from_extension(file_filename)
-        if file_category == "CODE":
-            analysis_messages = _build_code_analysis_messages(file_text_content, file_filename, language, prompt)
-        else:
-            analysis_messages = _build_document_analysis_messages(file_text_content, file_filename, prompt)
+        analysis_messages = _build_image_analysis_messages(
+            image_data_b64,
+            image_mime_type,
+            prompt,
+        )
 
+    elif file_category == "CODE":
+        language = get_language_from_extension(file_filename)
+        analysis_messages = _build_code_analysis_messages(
+            file_text_content,
+            file_filename,
+            language,
+            prompt,
+        )
+
+    else:
+        analysis_messages = _build_document_analysis_messages(
+            file_text_content,
+            file_filename,
+            prompt,
+        )
+
+    # Stream the model response.
     if stream:
+
         async def analysis_stream():
             full_response = ""
+
             try:
-                async for delta in stream_openai_chat(analysis_messages, model=OPENAI_VISION_MODEL):
+                async for delta in stream_openai_chat(
+                    analysis_messages,
+                    model=OPENAI_VISION_MODEL,
+                ):
                     full_response += delta
-                    yield sse({"type": "text_delta", "content": delta})
-            except Exception as e:
-                error_str = str(e)
-                logger.error(f"Analysis stream error: {error_str}")
+                    yield sse({
+                        "type": "text_delta",
+                        "content": delta,
+                    })
+
+            except Exception as exc:
+                error_str = str(exc)
+                logger.exception("Analysis stream error")
+
                 if not full_response:
                     full_response = f"[Analysis error: {error_str}]"
-                    yield sse({"type": "text_delta", "content": f"*Error: {error_str}*"})
+                    yield sse({
+                        "type": "text_delta",
+                        "content": f"*Analysis error: {error_str}*",
+                    })
 
             try:
-                await save_message(user["id"], conv_id, "assistant", full_response)
-            except Exception as e:
-                logger.error(f"Failed to save analysis response: {e}")
+                await save_message(
+                    user["id"],
+                    conv_id,
+                    "assistant",
+                    full_response,
+                )
+            except Exception:
+                logger.exception("Failed to save analysis response")
 
-            yield sse({"type": "done", "conversation_id": conv_id})
+            yield sse({
+                "type": "done",
+                "conversation_id": conv_id,
+            })
 
         return StreamingResponse(
             analysis_stream(),
@@ -1830,20 +1993,33 @@ async def analyze_file(
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
-            }
+            },
         )
-    else:
-        try:
-            response_text = await openai_chat_sync(analysis_messages, model=OPENAI_VISION_MODEL)
-        except Exception as e:
-            response_text = f"[Analysis error: {str(e)}]"
 
-        await save_message(user["id"], conv_id, "assistant", response_text)
+    # Return a normal JSON response when streaming is disabled.
+    try:
+        response_text = await openai_chat_sync(
+            analysis_messages,
+            model=OPENAI_VISION_MODEL,
+        )
+    except Exception as exc:
+        logger.exception("Analysis request failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Analysis failed: {str(exc)}",
+        )
 
-        return JSONResponse({
-            "response": response_text,
-            "conversation_id": conv_id
-        })
+    await save_message(
+        user["id"],
+        conv_id,
+        "assistant",
+        response_text,
+    )
+
+    return JSONResponse({
+        "response": response_text,
+        "conversation_id": conv_id,
+    })
 
 # =========================
 # MAIN CHAT ENDPOINT (Agent Mode)
