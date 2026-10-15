@@ -985,13 +985,295 @@ def generate_progressive_frames(image_b64: str, steps: int = 8) -> list:
 # =========================
 # ANALYSIS HELPERS
 # =========================
-def _build_image_analysis_messages(image_b64: str, mime_type: str, user_prompt: Optional[str]) -> list:
+
+IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"
+}
+
+CODE_EXTENSIONS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".css", ".scss",
+    ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".sh", ".bash", ".zsh", ".sql", ".java", ".kt", ".kts",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".cs", ".go", ".rs",
+    ".rb", ".php", ".swift", ".dart", ".r", ".R", ".m", ".scala",
+    ".vue", ".svelte", ".ipynb", ".dockerfile", ".tf", ".graphql",
+    ".gql", ".md", ".markdown"
+}
+
+TEXT_EXTENSIONS = {
+    ".txt", ".log", ".csv", ".tsv", ".env", ".conf", ".properties",
+    ".rst", ".tex", ".diff", ".patch"
+}
+
+
+def _is_image_mime(mime_type: Optional[str]) -> bool:
+    """Return True when a MIME type identifies an image."""
+    if not mime_type:
+        return False
+    return mime_type.lower().split(";")[0].strip().startswith("image/")
+
+
+def get_language_from_extension(filename: str) -> str:
+    """Get a readable language name for code-analysis prompts."""
+    extension = Path(filename).suffix.lower()
+
+    languages = {
+        ".py": "python",
+        ".js": "javascript",
+        ".jsx": "jsx",
+        ".ts": "typescript",
+        ".tsx": "tsx",
+        ".html": "html",
+        ".css": "css",
+        ".scss": "scss",
+        ".json": "json",
+        ".xml": "xml",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".toml": "toml",
+        ".ini": "ini",
+        ".cfg": "ini",
+        ".sh": "bash",
+        ".bash": "bash",
+        ".zsh": "bash",
+        ".sql": "sql",
+        ".java": "java",
+        ".kt": "kotlin",
+        ".kts": "kotlin",
+        ".c": "c",
+        ".h": "c",
+        ".cpp": "cpp",
+        ".hpp": "cpp",
+        ".cc": "cpp",
+        ".cs": "csharp",
+        ".go": "go",
+        ".rs": "rust",
+        ".rb": "ruby",
+        ".php": "php",
+        ".swift": "swift",
+        ".dart": "dart",
+        ".r": "r",
+        ".m": "objective-c",
+        ".scala": "scala",
+        ".vue": "vue",
+        ".svelte": "svelte",
+        ".ipynb": "json",
+        ".tf": "hcl",
+        ".graphql": "graphql",
+        ".gql": "graphql",
+        ".md": "markdown",
+        ".markdown": "markdown",
+        ".txt": "text",
+        ".csv": "csv",
+        ".tsv": "tsv",
+        ".log": "text",
+        ".env": "bash",
+    }
+
+    return languages.get(extension, "text")
+
+
+async def extract_text_safe(content_bytes: bytes) -> str:
+    """
+    Extract text from common document, text, and code formats.
+    Returns a clear message for unsupported or unreadable files.
+    """
+    if not content_bytes:
+        return ""
+
+    try:
+        # PDF
+        if content_bytes.startswith(b"%PDF"):
+            try:
+                import fitz  # PyMuPDF
+
+                with fitz.open(stream=content_bytes, filetype="pdf") as pdf:
+                    pages = []
+                    for page in pdf:
+                        text = page.get_text("text")
+                        if text:
+                            pages.append(text)
+
+                extracted = "\n\n".join(pages).strip()
+                if extracted:
+                    return extracted[:MAX_TEXT_LENGTH]
+
+                return (
+                    "[This PDF contains no extractable text. "
+                    "It may be a scanned document requiring OCR.]"
+                )
+            except ImportError:
+                logger.error("PDF extraction requires PyMuPDF.")
+                return "[PDF extraction unavailable: install PyMuPDF.]"
+            except Exception as e:
+                logger.warning("PDF extraction failed: %s", e)
+                return "[Could not read this PDF file.]"
+
+        # DOCX
+        if content_bytes.startswith(b"PK") and len(content_bytes) > 4:
+            try:
+                from docx import Document
+
+                with tempfile.NamedTemporaryFile(
+                    suffix=".docx", delete=False
+                ) as temp_file:
+                    temp_file.write(content_bytes)
+                    temp_path = temp_file.name
+
+                try:
+                    document = Document(temp_path)
+                    paragraphs = [
+                        paragraph.text
+                        for paragraph in document.paragraphs
+                        if paragraph.text.strip()
+                    ]
+
+                    for table in document.tables:
+                        for row in table.rows:
+                            cells = [
+                                cell.text.strip()
+                                for cell in row.cells
+                                if cell.text.strip()
+                            ]
+                            if cells:
+                                paragraphs.append(" | ".join(cells))
+
+                    extracted = "\n".join(paragraphs).strip()
+                    if extracted:
+                        return extracted[:MAX_TEXT_LENGTH]
+                finally:
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+
+            except ImportError:
+                logger.error("DOCX extraction requires python-docx.")
+                return "[Word extraction unavailable: install python-docx.]"
+            except Exception:
+                # The file may be XLSX, PPTX, or another ZIP-based format.
+                pass
+
+            # XLSX
+            try:
+                from openpyxl import load_workbook
+
+                workbook = load_workbook(
+                    io.BytesIO(content_bytes),
+                    read_only=True,
+                    data_only=True,
+                )
+                rows_text = []
+
+                try:
+                    for sheet in workbook.worksheets:
+                        rows_text.append(f"Sheet: {sheet.title}")
+
+                        for row in sheet.iter_rows(values_only=True):
+                            values = [
+                                str(value)
+                                for value in row
+                                if value is not None
+                            ]
+                            if values:
+                                rows_text.append(" | ".join(values))
+                finally:
+                    workbook.close()
+
+                extracted = "\n".join(rows_text).strip()
+                if extracted:
+                    return extracted[:MAX_TEXT_LENGTH]
+
+            except ImportError:
+                pass
+            except Exception:
+                pass
+
+            # PPTX
+            try:
+                from pptx import Presentation
+
+                presentation = Presentation(io.BytesIO(content_bytes))
+                slides_text = []
+
+                for slide_number, slide in enumerate(
+                    presentation.slides, start=1
+                ):
+                    slide_parts = []
+
+                    for shape in slide.shapes:
+                        if getattr(shape, "has_text_frame", False):
+                            text = shape.text.strip()
+                            if text:
+                                slide_parts.append(text)
+
+                        if getattr(shape, "has_table", False):
+                            for row in shape.table.rows:
+                                values = [
+                                    cell.text.strip()
+                                    for cell in row.cells
+                                    if cell.text.strip()
+                                ]
+                                if values:
+                                    slide_parts.append(" | ".join(values))
+
+                    if slide_parts:
+                        slides_text.append(
+                            f"Slide {slide_number}:\n"
+                            + "\n".join(slide_parts)
+                        )
+
+                extracted = "\n\n".join(slides_text).strip()
+                if extracted:
+                    return extracted[:MAX_TEXT_LENGTH]
+
+            except ImportError:
+                pass
+            except Exception:
+                pass
+
+        # Plain text and source code. UTF-8 first, then common fallback.
+        try:
+            decoded = content_bytes.decode("utf-8-sig")
+            if decoded.strip():
+                return decoded[:MAX_TEXT_LENGTH]
+        except UnicodeDecodeError:
+            pass
+
+        try:
+            decoded = content_bytes.decode("utf-16")
+            if decoded.strip():
+                return decoded[:MAX_TEXT_LENGTH]
+        except UnicodeDecodeError:
+            pass
+
+        # Last resort: accept content only if it looks reasonably textual.
+        decoded = content_bytes.decode("utf-8", errors="replace")
+        if decoded.strip():
+            replacement_ratio = decoded.count("\ufffd") / max(
+                len(decoded), 1
+            )
+            if replacement_ratio < 0.05 and "\x00" not in decoded:
+                return decoded[:MAX_TEXT_LENGTH]
+
+        return "[Binary or unreadable content]"
+
+    except Exception as e:
+        logger.exception("Unexpected text extraction error: %s", e)
+        return "[Binary or unreadable content]"
+
+
+def _build_image_analysis_messages(
+    image_b64: str,
+    mime_type: str,
+    user_prompt: Optional[str],
+) -> list:
     user_content = [
         {
             "type": "image_url",
             "image_url": {
                 "url": f"data:{mime_type};base64,{image_b64}"
-            }
+            },
         },
         {
             "type": "text",
@@ -999,41 +1281,30 @@ def _build_image_analysis_messages(image_b64: str, mime_type: str, user_prompt: 
                 "Analyze this image in detail. Describe what you see, "
                 "read any text, explain any code or diagrams, "
                 "and provide a comprehensive analysis."
-            )
-        }
-    ]
-    return [
-        {"role": "system", "content": BASE_SYSTEM_PROMPT},
-        {"role": "user", "content": user_content}
+            ),
+        },
     ]
 
-def _build_code_analysis_messages(code_text: str, filename: str, language: str, user_prompt: Optional[str]) -> list:
-    instruction = user_prompt or f"Analyze this {language} code from the file `{filename}`."
+    return [
+        {"role": "system", "content": BASE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _build_code_analysis_messages(
+    code_text: str,
+    filename: str,
+    language: str,
+    user_prompt: Optional[str],
+) -> list:
+    instruction = user_prompt or (
+        f"Analyze this {language} code from the file `{filename}`."
+    )
+
     user_content = f"""{instruction}
 
 ```{language.lower()}
 {code_text}
-```
-
-Provide a thorough code review covering: bugs, security issues, performance, style, and an improved version if needed."""
-    return [
-        {"role": "system", "content": BASE_SYSTEM_PROMPT},
-        {"role": "user", "content": user_content}
-    ]
-
-def _build_document_analysis_messages(doc_text: str, filename: str, user_prompt: Optional[str]) -> list:
-    instruction = user_prompt or f"Analyze the content from the file `{filename}`."
-    user_content = f"""{instruction}
-
---- FILE CONTENT START ---
-{doc_text}
---- FILE CONTENT END ---
-
-Provide a thorough analysis: summary, key points, structure, issues, and recommendations."""
-    return [
-        {"role": "system", "content": BASE_SYSTEM_PROMPT},
-        {"role": "user", "content": user_content}
-    ]
 
 # =========================
 # STREAMING GENERATORS
@@ -1426,17 +1697,25 @@ async def analyze_file(
         if len(content_bytes) == 0:
             raise HTTPException(400, "Empty file uploaded.")
 
-        if analysis_type and analysis_type != "auto":
-            file_category = analysis_type.upper()
-        else:
-            ext = Path(file_filename).suffix.lower()
-            if ext in IMAGE_EXTENSIONS:
-                file_category = "IMAGE"
-            elif ext in CODE_EXTENSIONS:
-                file_category = "CODE"
-            else:
-                file_category = "DOCUMENT"
+        requested_type = (analysis_type or "auto").strip().upper()
 
+if requested_type not in {"AUTO", "IMAGE", "CODE", "DOCUMENT"}:
+    raise HTTPException(
+        status_code=400,
+        detail="analysis_type must be auto, IMAGE, CODE, or DOCUMENT.",
+    )
+
+if requested_type != "AUTO":
+    file_category = requested_type
+else:
+    ext = Path(file_filename).suffix.lower()
+
+    if ext in IMAGE_EXTENSIONS:
+        file_category = "IMAGE"
+    elif ext in CODE_EXTENSIONS:
+        file_category = "CODE"
+    else:
+        file_category = "DOCUMENT"
         if file.content_type and _is_image_mime(file.content_type):
             file_category = "IMAGE"
 
