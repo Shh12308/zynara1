@@ -1711,50 +1711,81 @@ async def analyze_file(
     file_category = None
 
         if image_base64:
+
         file_category = "IMAGE"
+
         file_filename = file_filename or "uploaded_image.png"
 
     elif file and file.filename:
+
         file_filename = file.filename
+
         ext = Path(file_filename).suffix.lower()
+
         requested_type = (analysis_type or "auto").strip().upper()
 
         if requested_type not in {"AUTO", "IMAGE", "CODE", "DOCUMENT"}:
+
             raise HTTPException(
+
                 status_code=400,
+
                 detail="Invalid analysis_type. Use AUTO, IMAGE, CODE, or DOCUMENT.",
+
             )
 
         if requested_type != "AUTO":
+
             file_category = requested_type
+
+        elif ext in IMAGE_EXTENSIONS or _is_image_mime(file.content_type):
+
+            file_category = "IMAGE"
+
+        elif ext in CODE_EXTENSIONS:
+
+            file_category = "CODE"
+
+        elif ext in DOCUMENT_EXTENSIONS:
+
+            file_category = "DOCUMENT"
+
         else:
-            if ext in IMAGE_EXTENSIONS or _is_image_mime(file.content_type):
-                file_category = "IMAGE"
-            elif ext in CODE_EXTENSIONS:
-                file_category = "CODE"
-            elif ext in DOCUMENT_EXTENSIONS:
-                file_category = "DOCUMENT"
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unsupported file type: {ext or 'unknown'}",
-                )
+
+            raise HTTPException(
+
+                status_code=400,
+
+                detail=f"Unsupported file type: {ext or 'unknown'}",
+
+            )
 
         if file_category == "IMAGE":
+
             if (
+
                 not _is_image_mime(file.content_type)
+
                 and ext not in IMAGE_EXTENSIONS
+
             ):
+
                 raise HTTPException(
+
                     status_code=400,
+
                     detail="The uploaded file does not appear to be a supported image.",
+
                 )
 
     else:
+
         raise HTTPException(
+
             status_code=400,
+
             detail="Either 'file' or 'image_base64' must be provided.",
-        )
+)
     conv_id = await get_or_create_conversation(user["id"], conversation_id, f"Analysis: {file_filename}" if file_filename else "Image Analysis")
 
     user_msg_content = prompt or f"[Uploaded {file_filename} for analysis]"
