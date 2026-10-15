@@ -1740,7 +1740,9 @@ async def analyze_file(
 
         elif ext in IMAGE_EXTENSIONS or _is_image_mime(file.content_type):
 
-            file_category = "IMAGE"
+            if image_base64:
+
+        file_category = "IMAGE"
 
         elif ext in CODE_EXTENSIONS:
 
